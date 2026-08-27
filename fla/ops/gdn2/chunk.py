@@ -30,6 +30,7 @@ import warnings
 import torch
 
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
+from fla.ops.backends import dispatch
 from fla.ops.gdn2.chunk_bwd import chunk_gdn2_bwd
 from fla.ops.gdn2.chunk_fwd import chunk_gdn2_fwd
 from fla.ops.utils import prepare_chunk_indices
@@ -191,6 +192,7 @@ class ChunkGDN2Function(torch.autograd.Function):
         )
 
 
+@dispatch('gdn2')
 @torch.compiler.disable
 def chunk_gdn2(
     q: torch.Tensor,

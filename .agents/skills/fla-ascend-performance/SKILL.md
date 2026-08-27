@@ -23,9 +23,11 @@ Collection **must** use this skill's **generic scripts** — do not copy `torch_
 
 Environment: **Use the Python/NPU environment already active in the current terminal** (including any activated conda/venv). Run collection, analysis, and benchmarks in the same shell; do not spawn a new shell or switch environments mid-workflow. If the terminal has no NPU stack loaded yet, activate the project's Ascend environment first, then continue in that same session. Metrics, failure modes, code index: [reference.md](references/reference.md). Past kernel notes: [cases.md](references/cases.md).
 
+On a shared host, perform a fresh `npu-smi` preflight before every NPU workload. Record the selected physical device, baseline memory, and existing process owner; set `ASCEND_RT_VISIBLE_DEVICES` before importing `torch_npu`; never kill, pause, renice, or otherwise alter another user's process. Recheck occupancy before profiling and benchmarking because a previously idle device can become occupied while code is being prepared.
+
 Make the target backend semantically correct before optimizing; never hide missing capability or kernel bugs behind a Torch fallback. What generalizes: UB modeling, grid splits, layout/precision, and verification. Values like `BC=16`, K slabs of 64, or specific `mem_mult` are starting points only — do not copy them as rules.
 
-**Hard constraint (NPU launch params):** Ascend Triton kernels **do not support** `num_warps` or `num_stages`. During optimization these kwargs must **never** appear in `@triton.jit` launches, `triton.autotune` configs — do not copy them from CUDA Triton. Tune via tiles, grid, layout, fusion/split, and UB budget only.
+**Hard constraint (NPU launch params):** Ascend Triton kernels **do not support** `num_warps` or `num_stages`. During optimization these kwargs must **never** appear in `@triton.jit` launches, `triton.autotune` configs — do not copy them from CUDA Triton. Tune via tiles, grid, layout, fusion/split, and UB budget only. If a version-specific Ascend compiler API exposes a similarly named compiler option, record it separately with the exact version/API; it does not authorize passing `num_warps` or `num_stages` as kernel launch or autotune parameters.
 
 ## Progress checklist
 
@@ -44,7 +46,10 @@ Make the target backend semantically correct before optimizing; never hide missi
 2. Keep Torch reference implementations only in tests/benchmarks as the oracle.
 3. Pick shape/dtype/fwd±bwd; freeze tests, tolerances, and shapes during optimization — do not change tests to manufacture speedups.
 4. Baseline with synchronized timing (warmup + `torch.npu.synchronize()` + repeats); confirm the target NPU kernel runs, not a Torch fallback.
-5. Do not change the public API to fit the kernel; register backends under `IS_NPU` with lazy imports; verifiers must state real support ranges.
+5. Audit the complete runtime route: public entry → `@dispatch` → verifier → `triton_ascend` backend → target kernel. Record the route log, verifier rejection reason for unsupported cases, and a `FLA_DISABLE_BACKEND_DISPATCH=1` comparison when dispatch behavior changes.
+6. Separate compile/JIT, dispatch, metadata construction, layout conversion, device-kernel, synchronization, and end-to-end time. Check for device-scalar reads such as `.item()`, `.cpu()`, `.tolist()`, `.any()`, and `.max()`; reuse stable CPU metadata such as `cu_seqlens`, `chunk_indices`, and `chunk_offsets` when their lifetime permits.
+7. Record the exact SoC, driver, CANN, PyTorch, torch_npu, and Triton-Ascend version/commit. Treat compiler options and extension APIs as version- and hardware-sensitive capabilities; verify them on the target environment instead of inferring support from an unpinned `main` document.
+8. Do not change the public API to fit the kernel; register backends under `IS_NPU` with lazy imports; verifiers must state real support ranges.
 
 ## 2. Generic collection (required)
 
@@ -145,6 +150,7 @@ Change only levers that match the bottleneck; one hypothesis per round. Before t
 - **`make_block_ptr` offsets stay int32**: Triton rejects int64 `offsets/block_shape`. Flattened pointer math (`bos * D`, `t0 * D`, `i_b * stride`) uses int64; pass `i_t * BT` (int32) as the block row offset. Do not feed `t0` into `make_block_ptr`. Case: [causal_conv1d](references/cases.md#causal_conv1dpy--1d-core-grid--constexpr-dma-split).
 - **Varlen `cu_seqlens` → int64 for pointer math**: host dtype is often `torch.long`, but tests also pass `int32`; load as `tl.int64` either way. Loading `.to(tl.int32)` then `(bos * HV + i_hv) * V` overflows well before `bos` hits 2³¹ (HV=32, V=4096 → safe `bos` ≈ 16K). Pattern: `bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64); T_cur = (eos - bos).to(tl.int32)`. Non-varlen: `bos = tl.cast(i_b, tl.int64) * T` (CUDA/repo often writes `(i_b * T).to(tl.int64)`, which still wraps if `i_b * T` exceeds 2³¹). Alternative when `T_cur` only needs int32: load `bos` as int32 but cast **the index** before the large stride — `tl.cast(bos, tl.int64) * HV + i_h` then `* K`. `(bos * HV + i_h).to(tl.int64) * K` only fixes `* K`/`* V` (HV is small); `bos * HV` itself can still wrap.
 - Reductions / recurrence / grads use fp32 accum, cast on store; sensitive solves: `input_precision='ieee'` / `allow_tf32=False`; mask before exp on gated paths; keep a consistent `exp`/`exp2` base.
+- Only replace integer comparisons with FP32 comparisons when the integer range is proven exactly representable and the comparison semantics are unchanged. Do not apply this shortcut to arbitrary `cu_seqlens`, addresses, or long-context offsets; FP32 cannot exactly represent all large integers.
 - **Ascend `tl.dot` clobbers the left operand**: on NPU, `tl.dot(lhs, rhs, …)` may overwrite `lhs` in UB (CUDA Triton does not). Any later read of that tile (second lhs, rhs, store) sees corrupted data unless you reload from GM or copy with `tile + 0.0` **before** the first lhs dot. Full per-kernel catalog: [cases.md § tl.dot lhs clobber](references/cases.md#tldot-lhs-clobber--repo-wide-case-catalog). Symptom: silent numeric drift vs Torch oracle with no compile error.
 - **Audit checklist for new/changed kernels**: (1) `rg 'tl\.dot\(' fla/ops/**/triton_ascend/**` — only 8 op files use `tl.dot`; (2) for each lhs tile, flag lhs→lhs, lhs→rhs/store, or post-dot copy; (3) prefer GM reload for one reuse between stages, `+ 0.0` for tight multi-dot sequences; (4) re-run `tests/ops/test_gdn_kernels.py` + op-specific kernel tests.
 - **Upstream**: lhs clobber is a Triton-Ascend backend limitation (UB capacity / in-place matmul), not intentional API. Durable fix belongs in the compiler (preserve lhs or emit a diagnostic on post-dot read). Track via the Triton-Ascend / Ascend backend issue tracker.
@@ -173,10 +179,11 @@ Each round, in order:
 
 1. Single kernel vs Torch oracle (fp16/bf16, fwd+bwd).
 2. Shape matrix: small/large T, non-aligned tiles, head sharing, gate/state, fixed/varlen.
-3. End-to-end tests; confirm dispatch hits `triton_ascend`.
-4. Frozen full pytest gate (incl. NaN poisoning); on failure, stop — do not claim speedups.
-5. Synchronized benchmark (latency/throughput, fwd and fwd+bwd); re-profile with the same `aic_metrics` and confirm Duration/pipe/UB move as expected.
-6. Metrics unchanged → reclassify bottleneck or switch metrics; do not pile unrelated changes.
+3. Public-option matrix: initial/final state, state layout, gate-in-kernel versus precomputed gate, optional pointers, head mapping, and any supported chunk-size branches.
+4. End-to-end tests; confirm dispatch hits `triton_ascend` and that unsupported cases reject rather than silently falling back.
+5. Frozen full pytest gate (incl. NaN poisoning); on failure, stop — do not claim speedups.
+6. Synchronized benchmark (latency/throughput, fwd and fwd+bwd); re-profile with the same `aic_metrics` and confirm Duration/pipe/UB move as expected.
+7. Metrics unchanged → reclassify bottleneck or switch metrics; do not pile unrelated changes.
 
 Prefer: `tests/ops/test_gdn_kernels.py`, `tests/ops/test_solve_tril.py`, `tests/modules/test_conv.py` (causal_conv1d), `tests/utils/test_ascend_ub_manager.py`, `python -m benchmarks.ops.verify --op <op> --base <ref>` (`--gate-k` is a quick signal only).
 
@@ -188,7 +195,12 @@ After re-profile, report:
 - Pipe ratios: Cube/MAC, Vector, scalar, MTE1, MTE2, MTE3
 - UB bandwidth (if MemoryUB run collected)
 - Any unsupported triton-ascend ops encountered and workarounds used
+- Dispatch route, verifier result, and whether a dispatch-disabled/default-path comparison was run
+- Compile/JIT, metadata, layout-conversion, synchronization, device-kernel, and end-to-end timings when they are material
+- Hardware/software versions, device preflight, shape bucket, warmup/repeat/synchronization policy, and artifact paths
 - Whether another round is warranted (per `fla-optimization-loop` stop criteria)
+
+Stop an optimization track after reaching a measured resource/performance floor, or after three distinct evidence-backed directions fail to improve the frozen target while the profiler shows no new dominant bottleneck. Record the dropped hypotheses and reasons; do not continue changing code without a new measurement signal.
 
 Generalizable fixes discovered during optimization belong in this skill (`SKILL.md`, `references/reference.md`, or `references/cases.md`) in a separate doc commit — not bundled into a perf PR.
 
@@ -198,6 +210,8 @@ Generalizable fixes discovered during optimization belong in this skill (`SKILL.
 - [ ] No Torch fallback on production paths; unsupported cases error / verifier rejects
 - [ ] No `num_warps` / `num_stages` in Ascend kernel launches, autotune configs, or wrappers
 - [ ] Backend registration, lazy import, public signatures correct
+- [ ] Public route, verifier acceptance/rejection, and dispatch-disabled comparison are recorded; no Torch/default fallback is hidden on the production path
+- [ ] Shared-host device preflight, physical-device mapping, and process ownership were checked before workload launch
 - [ ] Peak live tiles estimated; tiles from shared helpers + safety margin
 - [ ] Grid ≤ 65535 **or** 1D core-grid (`num_aicore` Cube / `num_vectorcore` Vector); host-split offsets not double-counted with varlen; task-loop pointers rebound each iteration
 - [ ] Runtime `block_ptr` vs masked DMA: constexpr-split so bulk DCE's the unused path; tail DMA does not overshoot packed `B*T` (include halo)
@@ -212,6 +226,7 @@ Generalizable fixes discovered during optimization belong in this skill (`SKILL.
 - [ ] Optional-arg paths exercised (e.g. `use_g` True/False with `g=None` reference) when PR touches gated and ungated paths
 - [ ] Did not weaken tests/tolerances/benchmarks for “wins”; synced bench + re-profile on target NPU
 - [ ] Round summary includes pipe/UB metrics (template above)
+- [ ] Host/runtime costs, JIT/cache behavior, metadata reuse, and layout conversion were considered when they can affect end-to-end latency
 
 ## Anti-patterns
 
@@ -227,6 +242,8 @@ Generalizable fixes discovered during optimization belong in this skill (`SKILL.
 - `if CONSTEXPR_FLAG or runtime:` around an optional pointer — else still compiles when the ptr is None
 - `B.to(tl.int64)` / `i_t.to(tl.int64)` on specialized or folded constexpr ints (`constexpr` has no `.to`); use `tl.cast`
 - Passing int64 `t0` as `make_block_ptr` offsets (`offsets/block_shape` must be int32)
+- Treating FP32 compare as a general replacement for integer compare without proving the integer range and semantics
+- Reporting a kernel-only win when layout conversion, metadata construction, synchronization, or dispatch overhead makes end-to-end time worse
 
 ## Related files
 
@@ -236,4 +253,5 @@ Generalizable fixes discovered during optimization belong in this skill (`SKILL.
 - **Gate `g` stride-1 loading (G_T_CONTIG)**: [g-contiguous-loading.md](references/g-contiguous-loading.md)
 - **causal_conv1d 1D core-grid + constexpr DMA split**: [cases.md § causal_conv1d](references/cases.md#causal_conv1dpy--1d-core-grid--constexpr-dma-split)
 - Ascend-specific traps (DMA dual-path UB, None-ptr compile, `constexpr` `.to`, int64 `block_ptr` offsets): [TRAPS.md](references/TRAPS.md)
+- **Expanded optimization methods and external cases (Host/runtime, metadata/JIT, compiler/SoC options):** [NPU_TRITON_PERFORMANCE_OPTIMIZATION_v2.md](NPU_TRITON_PERFORMANCE_OPTIMIZATION_v2.md). This is a reference and case library; the hard constraints and verification gates in this `SKILL.md` take precedence.
 - Ad-hoc workload output dir: `npu_prof/` (new collection must use the generic scripts)

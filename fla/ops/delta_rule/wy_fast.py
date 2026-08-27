@@ -9,6 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
+from fla.ops.backends import dispatch
 from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import safe_dot
@@ -237,6 +238,7 @@ def prepare_wy_repr_fwd(
     return w, u, A
 
 
+@dispatch('delta_rule')
 def recompute_w_u_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -277,6 +279,7 @@ def recompute_w_u_fwd(
     return w, u
 
 
+@dispatch('delta_rule')
 def prepare_wy_repr_bwd(
     k: torch.Tensor,
     v: torch.Tensor,

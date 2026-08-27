@@ -21,6 +21,7 @@ import torch
 import triton
 import triton.language as tl
 
+from fla.ops.backends import dispatch
 from fla.ops.utils.cache import fla_cache_autotune
 from fla.ops.utils.op import exp2
 from fla.utils import autotune_cache_kwargs
@@ -132,6 +133,7 @@ def chunk_gdn2_fwd_kernel_intra_token_parallel(
         )
 
 
+@dispatch('gdn2')
 def chunk_gdn2_fwd_intra_token_parallel(
     q: torch.Tensor,
     k: torch.Tensor,

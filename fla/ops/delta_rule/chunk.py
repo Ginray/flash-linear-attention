@@ -8,6 +8,7 @@
 import torch
 
 from fla.modules.l2norm import l2norm_bwd, l2norm_fwd
+from fla.ops.backends import dispatch
 from fla.ops.common.chunk_delta_h import chunk_gated_delta_rule_bwd_dhu, chunk_gated_delta_rule_fwd_h
 from fla.ops.common.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
 from fla.ops.delta_rule.wy_fast import prepare_wy_repr_bwd, prepare_wy_repr_fwd, recompute_w_u_fwd
@@ -223,6 +224,59 @@ class ChunkDeltaRuleFunction(torch.autograd.Function):
         return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), db.to(beta.dtype), None, dh0, None, None, None, None, None
 
 
+def _chunk_delta_rule_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float | None = None,
+    initial_state: torch.Tensor | None = None,
+    output_final_state: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
+    cu_seqlens: torch.LongTensor | None = None,
+    cu_seqlens_cpu: torch.LongTensor | None = None,
+    **kwargs,
+):
+    assert q.dtype == k.dtype == v.dtype
+    assert q.dtype != torch.float32, "ChunkDeltaRuleFunction does not support float32. Please use bfloat16."
+    assert len(beta.shape) == 3, "beta must be of shape (batch size, num of head, seq len)."
+
+    if 'head_first' in kwargs:
+        raise DeprecationWarning(
+            "head_first has been removed. Inputs must be in `[B, T, H, ...]` format.",
+        )
+    chunk_size = kwargs.pop('chunk_size', 64)
+    if chunk_size not in (16, 32, 64):
+        raise ValueError(f"`chunk_size` must be 16, 32, or 64, got {chunk_size}.")
+    if cu_seqlens is not None:
+        if q.shape[0] != 1:
+            raise ValueError(
+                f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`. "
+                f"Please flatten variable-length inputs before processing.",
+            )
+        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
+            raise ValueError(
+                f"The number of initial states is expected to be equal to the number of input sequences, "
+                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
+            )
+    scale = k.shape[-1] ** -0.5 if scale is None else scale
+    o, final_state = ChunkDeltaRuleFunction.apply(
+        q,
+        k,
+        v,
+        beta,
+        scale,
+        initial_state,
+        output_final_state,
+        use_qk_l2norm_in_kernel,
+        cu_seqlens,
+        cu_seqlens_cpu,
+        chunk_size,
+    )
+    return o, final_state
+
+
+@dispatch('delta_rule')
 @torch.compiler.disable
 def chunk_delta_rule(
     q: torch.Tensor,
@@ -299,40 +353,16 @@ def chunk_delta_rule(
             cu_seqlens=cu_seqlens
         )
     """
-    assert q.dtype == k.dtype == v.dtype
-    assert q.dtype != torch.float32, "ChunkDeltaRuleFunction does not support float32. Please use bfloat16."
-    assert len(beta.shape) == 3, "beta must be of shape (batch size, num of head, seq len)."
-
-    if 'head_first' in kwargs:
-        raise DeprecationWarning(
-            "head_first has been removed. Inputs must be in `[B, T, H, ...]` format.",
-        )
-    chunk_size = kwargs.pop('chunk_size', 64)
-    if chunk_size not in (16, 32, 64):
-        raise ValueError(f"`chunk_size` must be 16, 32, or 64, got {chunk_size}.")
-    if cu_seqlens is not None:
-        if q.shape[0] != 1:
-            raise ValueError(
-                f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`. "
-                f"Please flatten variable-length inputs before processing.",
-            )
-        if initial_state is not None and initial_state.shape[0] != len(cu_seqlens) - 1:
-            raise ValueError(
-                f"The number of initial states is expected to be equal to the number of input sequences, "
-                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state.shape[0]}.",
-            )
-    scale = k.shape[-1] ** -0.5 if scale is None else scale
-    o, final_state = ChunkDeltaRuleFunction.apply(
-        q,
-        k,
-        v,
-        beta,
-        scale,
-        initial_state,
-        output_final_state,
-        use_qk_l2norm_in_kernel,
-        cu_seqlens,
-        cu_seqlens_cpu,
-        chunk_size,
+    return _chunk_delta_rule_impl(
+        q=q,
+        k=k,
+        v=v,
+        beta=beta,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        cu_seqlens=cu_seqlens,
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        **kwargs,
     )
-    return o, final_state
