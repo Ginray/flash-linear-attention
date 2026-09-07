@@ -129,6 +129,26 @@ def test_fused_recurrent(B, T, H, HV, K, V, scale, use_qk_l2norm_in_kernel, dtyp
     assert_close("ht", ref_ht, tri_ht, 0.005)
 
 
+@pytest.mark.skipif(not IS_NPU, reason='Triton-Ascend fused recurrent routing is only exercised on NPU')
+def test_fused_recurrent_npu_backend_routing(monkeypatch):
+    """The public fused-recurrent call must enter the Triton-Ascend backend."""
+    from fla.ops.gdn2.backends.triton_ascend import fused_recurrent as npu_impl
+
+    spy = Mock(wraps=npu_impl.fused_recurrent_gdn2_fwd_npu)
+    monkeypatch.setattr(npu_impl, 'fused_recurrent_gdn2_fwd_npu', spy)
+    q, k, v, g, b, w, _, _ = _rand_inputs(1, 2, 1, 1, 32, 32, torch.float16)
+    fused_recurrent_gdn2(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        b=b,
+        w=w,
+        output_final_state=True,
+    )
+    spy.assert_called_once()
+
+
 @pytest.mark.skipif(not (IS_NVIDIA or IS_AMD or IS_NPU), reason="CUDA/ROCm or Ascend NPU required")
 @pytest.mark.parametrize(
     ("B", "T", "H", "K", "V", "has_a_log", "has_dt_bias", "safe_gate"),
@@ -581,6 +601,42 @@ def test_chunk_npu_fwd_verifier_rejects_oversized_k():
     )
     assert not accepted
     assert reason == 'GDN-2 Ascend intra requires next_power_of_2(K) <= 256 for UB capacity, got K=257 (BK=512)'
+
+
+@pytest.mark.skipif(not IS_NPU, reason='Ascend verifier checks require NPU')
+@pytest.mark.parametrize(
+    ('case', 'expected', 'reason'),
+    [
+        pytest.param('accept', True, None, id='accept-bk32'),
+        pytest.param('mixed_device', False, 'NPU tensors', id='mixed-device'),
+    ],
+)
+def test_fused_recurrent_npu_verifier(case, expected, reason):
+    """Verifier decisions must reflect the backend's routing requirements."""
+    from fla.ops.gdn2.backends.triton_ascend import TritonAscendGDN2Backend
+
+    K = 32
+    B, T, H, HV, V = 1, 1, 1, 1, 32
+    dtype = torch.float16
+    q = torch.zeros(B, T, H, K, dtype=dtype, device=device)
+    k = torch.zeros_like(q)
+    g = torch.zeros(B, T, HV, K, dtype=dtype, device=device)
+    b = torch.zeros_like(g)
+    v = torch.zeros(B, T, HV, V, dtype=dtype, device=device)
+    w = torch.zeros_like(v)
+    if case == 'mixed_device':
+        q = q.cpu()
+    accepted, actual_reason = TritonAscendGDN2Backend().fused_recurrent_gdn2_fwd_verifier(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        b=b,
+        w=w,
+    )
+    assert accepted is expected
+    if reason is not None:
+        assert reason in actual_reason
 
 
 @pytest.mark.skipif(not IS_NPU, reason='Ascend dispatch and launch splitting require NPU')
