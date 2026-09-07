@@ -16,11 +16,14 @@
 # GDN-2 reuses KDA's gate activation verbatim, so the gate-in-kernel reference
 # uses ``naive_kda_gate`` / ``naive_kda_lowerbound_gate``.
 
+from unittest.mock import patch
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from fla.ops.gdn2 import chunk_gdn2, fused_recurrent_gdn2, naive_recurrent_gdn2
+from fla.ops.gdn2.fused_recurrent import fused_recurrent_gdn2_fwd
 from fla.ops.kda.gate import naive_kda_gate, naive_kda_lowerbound_gate
 from fla.utils import IS_AMD, IS_NPU, IS_NVIDIA, assert_close, device
 
@@ -90,6 +93,9 @@ def _rand_inputs(B, T, H, HV, K, V, dtype, *, gate_in_kernel=False, b_scale=1.0,
             (2, 128, 2, 4, 64, 64, 1.0, False, torch.float32),    # GVA: HV > H
             (2, 100, 2, 4, 64, 128, 1.0, True, torch.float16),    # GVA + l2norm + fp16, V != K
             (1, 4, 1, 1, 48, 16, 1.0, False, torch.float32),      # non-power-of-2 K
+            (1, 5, 2, 2, 256, 256, 1.0, True, torch.bfloat16),
+            (1, 5, 2, 2, 256, 320, 1.0, True, torch.float32),
+            (1, 1, 65536, 65536, 1, 1, 1.0, False, torch.float32),
         ]
     ],
 )
@@ -117,9 +123,11 @@ def test_fused_recurrent(B, T, H, HV, K, V, scale, use_qk_l2norm_in_kernel, dtyp
         scale=scale,
         output_final_state=True,
     )
+    inputs = (q if use_qk_l2norm_in_kernel else qn, k if use_qk_l2norm_in_kernel else kn, v, g, b, w)
+    saved_inputs = [x.clone() for x in inputs]
     tri, tri_ht = fused_recurrent_gdn2(
-        q=q if use_qk_l2norm_in_kernel else qn,
-        k=k if use_qk_l2norm_in_kernel else kn,
+        q=inputs[0],
+        k=inputs[1],
         v=v,
         g=g,
         b=b,
@@ -130,6 +138,10 @@ def test_fused_recurrent(B, T, H, HV, K, V, scale, use_qk_l2norm_in_kernel, dtyp
     )
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
+    assert tri_ht.shape == ref_ht.shape
+    assert tri_ht.dtype == torch.float32 and tri_ht.is_contiguous()
+    for original, actual in zip(saved_inputs, inputs):
+        torch.testing.assert_close(actual, original, rtol=0, atol=0)
 
 
 @_requires_accelerator
@@ -198,11 +210,13 @@ def test_fused_recurrent_state_v_first():
 
 
 @_requires_accelerator
-def test_fused_recurrent_initial_state():
+@pytest.mark.parametrize("T", [1, 64])
+def test_fused_recurrent_initial_state(T):
     dtype = torch.float32
-    B, T, H, K, V = 2, 64, 2, 64, 64
+    B, H, K, V = 2, 2, 64, 64
     q, k, v, g, b, w, _, _ = _rand_inputs(B, T, H, H, K, V, dtype)
     h0 = torch.randn(B, H, K, V, device=device, dtype=torch.float32)
+    saved_h0 = h0.clone()
 
     ref, ref_ht = naive_recurrent_gdn2(
         q=F.normalize(q.float(), p=2, dim=-1).to(dtype),
@@ -227,6 +241,7 @@ def test_fused_recurrent_initial_state():
     )
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
+    torch.testing.assert_close(h0, saved_h0, rtol=0, atol=0)
 
 
 @_requires_accelerator
@@ -278,6 +293,81 @@ def test_fused_recurrent_varlen(cu_seqlens, H, K, V):
         ref_hts.append(ht_i)
     assert_close("o", torch.cat(refs, 1), tri, 0.005)
     assert_close("ht", torch.cat(ref_hts, 0), tri_ht, 0.005)
+
+
+@_requires_accelerator
+@pytest.mark.parametrize("state_v_first", [False, True])
+@pytest.mark.parametrize("inplace_final_state", [False, True])
+def test_fused_recurrent_state_buffers(state_v_first, inplace_final_state):
+    q, k, v, g, b, w, _, _ = _rand_inputs(1, 5, 2, 2, 64, 48, torch.float32)
+    q, k = F.normalize(q, dim=-1), F.normalize(k, dim=-1)
+    h0 = torch.randn(1, 2, 64, 48, device=device)
+    ref, ref_ht = naive_recurrent_gdn2(
+        q=q, k=k, v=v, g=g, b=b, w=w, initial_state=h0, output_final_state=True,
+    )
+    if state_v_first:
+        h0 = h0.transpose(-1, -2).contiguous()
+        ref_ht = ref_ht.transpose(-1, -2).contiguous()
+    saved_h0 = h0.clone()
+    out = torch.full_like(v, float("nan"))
+    actual, ht = fused_recurrent_gdn2_fwd(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        b=b,
+        w=w,
+        initial_state=h0,
+        output_final_state=True,
+        inplace_final_state=inplace_final_state,
+        state_v_first=state_v_first,
+        out=out,
+    )
+    assert actual is out
+    assert_close("o", ref, actual, 0.005)
+    assert_close("ht", ref_ht, ht, 0.005)
+    if inplace_final_state:
+        assert ht is h0
+    else:
+        assert ht is not h0
+        torch.testing.assert_close(h0, saved_h0, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not IS_NPU, reason="NPU required")
+@pytest.mark.parametrize("buffer", ["initial_state", "out"])
+def test_fused_recurrent_noncontiguous_buffer(buffer):
+    q, k, v, g, b, w, _, _ = _rand_inputs(1, 5, 2, 2, 64, 48, torch.float32)
+    shape = (1, 2, 48, 64) if buffer == "initial_state" else (1, 5, 48, 2)
+    value = torch.randn(*shape, device=device).transpose(-1, -2)
+    saved = value.clone()
+    with pytest.raises(ValueError, match=f"`{buffer}` must be contiguous"):
+        fused_recurrent_gdn2_fwd(q=q, k=k, v=v, g=g, b=b, w=w, **{buffer: value})
+    torch.testing.assert_close(value, saved, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not IS_NPU, reason="NPU required")
+def test_fused_recurrent_backend_routing():
+    from fla.ops.gdn2.backends.triton_ascend import fused_recurrent as ascend
+
+    q, k, v, g, b, w, _, _ = _rand_inputs(1, 5, 2, 2, 64, 48, torch.float32)
+    with patch.object(ascend, "fused_recurrent_gdn2_fwd_npu", wraps=ascend.fused_recurrent_gdn2_fwd_npu) as forward:
+        _, ht = fused_recurrent_gdn2(q=q, k=k, v=v, g=g, b=b, w=w, use_qk_l2norm_in_kernel=True)
+    forward.assert_called_once()
+    assert ht is None
+
+
+@pytest.mark.skipif(not IS_NPU, reason="NPU required")
+@pytest.mark.parametrize("case", ["missing", "cpu", "dtype"])
+def test_fused_recurrent_backend_rejection(case):
+    from fla.ops.gdn2.backends.triton_ascend import TritonAscendGDN2Backend
+
+    q, reason = {
+        "missing": (None, "missing required tensor"),
+        "cpu": (torch.zeros(1, device="cpu"), "must be on NPU"),
+        "dtype": (torch.zeros(1, device=device, dtype=torch.int32), "unsupported GDN-2 Ascend dtype"),
+    }[case]
+    accepted, message = TritonAscendGDN2Backend().fused_recurrent_gdn2_fwd_verifier(q=q)
+    assert not accepted and reason in message
 
 
 # =============================================================================

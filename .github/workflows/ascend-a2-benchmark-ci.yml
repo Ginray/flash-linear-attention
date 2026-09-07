@@ -160,7 +160,7 @@ jobs:
           print("matplotlib savefig smoke test: ok")
           PY
 
-      - name: Benchmark chunk_gdn, chunk_gdn2, chunk_kda, fused_attnres, and conv1d
+      - name: Benchmark chunk_gdn, chunk_gdn2, fused_recurrent_gdn2, chunk_kda, fused_attnres, and conv1d
         shell: bash
         env:
           FLA_BENCH_WARMUP_MS: "25"
@@ -180,8 +180,13 @@ jobs:
             return "$rc"
           }
 
-          run_benchmark chunk_gdn 0 python -m benchmarks.ops.run \
-            --op chunk_gdn --base '' --json benchmark_chunk_gdn.json &
+          (
+            set -e
+            run_benchmark chunk_gdn 0 python -m benchmarks.ops.run \
+              --op chunk_gdn --base '' --json benchmark_chunk_gdn.json
+            run_benchmark fused_recurrent_gdn2 0 python -m benchmarks.ops.run \
+              --op fused_recurrent_gdn2 --base '' --json benchmark_fused_recurrent_gdn2.json
+          ) &
           pid_gdn=$!
           run_benchmark chunk_kda 1 python -m benchmarks.ops.run \
             --op chunk_kda --base '' --json benchmark_chunk_kda.json &
@@ -239,6 +244,8 @@ jobs:
           cat chunk_gdn2.log
           echo "========== chunk_gdn2 (B1 T32768 H1 K32 V32) =========="
           cat chunk_gdn2_32k.log
+          echo "========== fused_recurrent_gdn2 =========="
+          cat fused_recurrent_gdn2.log
           echo "========== chunk_kda =========="
           cat chunk_kda.log
           echo "========== fused_attnres =========="
@@ -246,6 +253,26 @@ jobs:
           echo "========== conv1d =========="
           cat conv1d.log
           exit "$status"
+
+      - name: Check fused-recurrent GDN2 benchmark results
+        shell: bash
+        run: |
+          source /usr/local/Ascend/ascend-toolkit/set_env.sh
+          python - <<'PY'
+          import json
+          import math
+
+          from benchmarks.ops.registry import SHAPE_CONFIGS
+
+          with open("benchmark_fused_recurrent_gdn2.json") as f:
+              results = json.load(f)["results"]
+          expected = {tuple(shape[key] for key in ("B", "T", "H", "D")) for shape in SHAPE_CONFIGS.values()}
+          actual = {tuple(row[key] for key in ("B", "T", "H", "D")) for row in results}
+          assert actual == expected and len(results) == len(expected), f"Incomplete GDN2 benchmark: {actual} != {expected}"
+          for row in results:
+              assert row["op"] == "fused_recurrent_gdn2" and row["mode"] == "fwd", row
+              assert all(math.isfinite(row[key]) and row[key] > 0 for key in ("median_ms", "p20_ms", "p80_ms")), row
+          PY
 
       - name: Upload benchmark results
         if: always()
@@ -256,6 +283,7 @@ jobs:
             benchmark_chunk_gdn.json
             benchmark_chunk_gdn2.json
             benchmark_chunk_gdn2_32k.json
+            benchmark_fused_recurrent_gdn2.json
             benchmark_chunk_kda.json
             benchmark_fused_attnres.json
             conv_benchmark/

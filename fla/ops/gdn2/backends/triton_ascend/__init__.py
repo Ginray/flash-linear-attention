@@ -13,9 +13,11 @@ import torch
 
 from fla.ops.backends import BaseBackend
 
+_SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
 
 class TritonAscendGDN2Backend(BaseBackend):
-    """Ascend NPU backend for GDN-2 chunk kernels."""
+    """Ascend NPU backend for GDN-2 kernels."""
 
     backend_type = "triton_ascend"
     package_name = None
@@ -157,3 +159,17 @@ class TritonAscendGDN2Backend(BaseBackend):
             chunk_indices,
             state_v_first,
         )
+
+    def fused_recurrent_gdn2_fwd_verifier(self, *args, **kwargs):
+        q = kwargs.get("q", args[0] if args else None)
+        if q is None:
+            return False, "missing required tensor `q`"
+        if q.device.type != "npu":
+            return False, f"`q` must be on NPU, got {q.device.type}"
+        if q.dtype not in _SUPPORTED_DTYPES:
+            return False, f"unsupported GDN-2 Ascend dtype {q.dtype}"
+        return True, None
+
+    def fused_recurrent_gdn2_fwd(self, *args, **kwargs):
+        from fla.ops.gdn2.backends.triton_ascend.fused_recurrent import fused_recurrent_gdn2_fwd_npu
+        return fused_recurrent_gdn2_fwd_npu(*args, **kwargs)
