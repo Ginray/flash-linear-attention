@@ -40,227 +40,242 @@ def _get_bk(K: int) -> int:
 
 
 @triton.heuristics({'IS_VARLEN': lambda args: args['cu_seqlens'] is not None})
-@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'NC_OFFSET', 'BH_OFFSET'])
+@triton.jit(do_not_specialize=['T', 'task_num', 'num_core', 'BH'])
 def chunk_gla_fwd_A_kernel_intra_sub_inter_npu(
     q, k, g, A, cu_seqlens, chunk_indices, scale, T,
     H: tl.constexpr, K: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, BK: tl.constexpr, NC: tl.constexpr,
-    IS_VARLEN: tl.constexpr, NT_OFFSET, NC_OFFSET, BH_OFFSET,
+    IS_VARLEN: tl.constexpr, task_num, num_core, BH,
 ):
-    i_t = tl.program_id(0).to(tl.int64) + NT_OFFSET
-    i_c = tl.program_id(1) + NC_OFFSET
-    i_bh = tl.program_id(2).to(tl.int64) + BH_OFFSET
-    i_b, i_h = i_bh // H, i_bh % H
-    i_i, i_j = i_c // NC, i_c % NC
-    if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
-        T = eos - bos
-    else:
-        bos = tl.cast(i_b, tl.int64) * T
-        eos = bos + T
+    core_id = tl.program_id(0)
+    T_seq = tl.cast(T, tl.int64)
+    for tid in tl.range(core_id, task_num, num_core):
+        task_id = tl.cast(tid, tl.int64)
+        i_bh = task_id % BH
+        i_tc = task_id // BH
+        i_i = tl.cast(i_tc % NC, tl.int64)
+        i_t = tl.cast(i_tc // NC, tl.int64)
+        i_b, i_h = i_bh // H, i_bh % H
+        if IS_VARLEN:
+            i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
+            bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+            T_cur = eos - bos
+        else:
+            bos = tl.cast(i_b, tl.int64) * T_seq
+            eos = bos + T_seq
+            T_cur = T_seq
 
-    if i_t * BT + i_i * BC >= T:
-        return
-    if i_i <= i_j:
-        return
+        if i_t * BT + i_i * BC < T_cur:
+            o_i = i_t * BT + i_i * BC + tl.arange(0, BC)
+            m_i = o_i < T_cur
 
-    b_A = tl.zeros([BC, BC], dtype=tl.float32)
-    o_i = i_t * BT + i_i * BC + tl.arange(0, BC)
-    o_j = i_t * BT + i_j * BC + tl.arange(0, BC)
-    m_i = o_i < T
-    m_j = o_j < T
-    for i_k in range(tl.cdiv(K, BK)):
-        o_k = i_k * BK + tl.arange(0, BK)
-        m_k = o_k < K
-        m_qk = m_i[:, None] & m_k[None, :]
-        m_kj = m_k[:, None] & m_j[None, :]
+            for i_j in range(0, i_i):
+                b_A = tl.zeros([BC, BC], dtype=tl.float32)
+                o_j = i_t * BT + i_j * BC + tl.arange(0, BC)
+                m_j = o_j < T_cur
+                for i_k in range(tl.cdiv(K, BK)):
+                    o_k = i_k * BK + tl.arange(0, BK)
+                    m_k = o_k < K
+                    m_qk = m_i[:, None] & m_k[None, :]
+                    m_kj = m_k[:, None] & m_j[None, :]
 
-        p_q = q + (bos * H + i_h) * K + o_i[:, None] * (H * K) + o_k[None, :]
-        p_g = g + (bos * H + i_h) * K + o_i[:, None] * (H * K) + o_k[None, :]
-        p_k = k + (bos * H + i_h) * K + o_k[:, None] + o_j[None, :] * (H * K)
-        p_gk = g + (bos * H + i_h) * K + o_k[:, None] + o_j[None, :] * (H * K)
-        p_gn = g + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
+                    p_q = q + (bos * H + i_h) * K + o_i[:, None] * (H * K) + o_k[None, :]
+                    p_g = g + (bos * H + i_h) * K + o_i[:, None] * (H * K) + o_k[None, :]
+                    p_k = k + (bos * H + i_h) * K + o_k[:, None] + o_j[None, :] * (H * K)
+                    p_gk = g + (bos * H + i_h) * K + o_k[:, None] + o_j[None, :] * (H * K)
+                    p_gn = g + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
 
-        b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)
-        b_q = tl.load(p_q, mask=m_qk, other=0.0).to(tl.float32)
-        b_g = tl.load(p_g, mask=m_qk, other=0.0).to(tl.float32)
-        b_qg = b_q * exp2(b_g - b_gn[None, :]) * scale
-        b_k = tl.load(p_k, mask=m_kj, other=0.0).to(tl.float32)
-        b_gk = tl.load(p_gk, mask=m_kj, other=0.0).to(tl.float32)
-        b_kg = b_k * exp2(b_gn[:, None] - b_gk)
-        b_A = tl.dot(b_qg, b_kg, b_A, allow_tf32=False)
+                    b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)
+                    b_q = tl.load(p_q, mask=m_qk, other=0.0).to(tl.float32)
+                    b_g = tl.load(p_g, mask=m_qk, other=0.0).to(tl.float32)
+                    b_qg = b_q * exp2(b_g - b_gn[None, :]) * scale
+                    b_k = tl.load(p_k, mask=m_kj, other=0.0).to(tl.float32)
+                    b_gk = tl.load(p_gk, mask=m_kj, other=0.0).to(tl.float32)
+                    b_kg = b_k * exp2(b_gn[:, None] - b_gk)
+                    b_A = tl.dot(b_qg, b_kg, b_A, allow_tf32=False)
 
-    o_jA = i_j * BC + tl.arange(0, BC)
-    m_A = m_i[:, None] & (o_jA[None, :] < BT)
-    p_A = A + (bos * H + i_h) * BT + o_i[:, None] * (H * BT) + o_jA[None, :]
-    tl.store(p_A, b_A.to(A.dtype.element_ty), mask=m_A)
+                o_jA = i_j * BC + tl.arange(0, BC)
+                m_A = m_i[:, None] & (o_jA[None, :] < BT)
+                p_A = A + (bos * H + i_h) * BT + o_i[:, None] * (H * BT) + o_jA[None, :]
+                tl.store(p_A, b_A.to(A.dtype.element_ty), mask=m_A)
 
 
 @triton.heuristics({'IS_VARLEN': lambda args: args['cu_seqlens'] is not None})
-@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'NC_OFFSET', 'BH_OFFSET'])
+@triton.jit(do_not_specialize=['T', 'task_num', 'num_core', 'BH'])
 def chunk_gla_fwd_A_kernel_intra_sub_intra_npu(
     q, k, g, A, cu_seqlens, chunk_indices, scale, T,
-    H: tl.constexpr, K: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, BK: tl.constexpr,
-    IS_VARLEN: tl.constexpr, NT_OFFSET, NC_OFFSET, BH_OFFSET,
+    H: tl.constexpr, K: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, BK: tl.constexpr, NC: tl.constexpr,
+    IS_VARLEN: tl.constexpr, task_num, num_core, BH,
 ):
-    i_t = tl.program_id(0).to(tl.int64) + NT_OFFSET
-    i_i = tl.program_id(1) + NC_OFFSET
-    i_bh = tl.program_id(2).to(tl.int64) + BH_OFFSET
-    i_b, i_h = i_bh // H, i_bh % H
-    i_j = i_i
-    if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
-        T = eos - bos
-    else:
-        bos = tl.cast(i_b, tl.int64) * T
-        eos = bos + T
+    core_id = tl.program_id(0)
+    BH_i64 = tl.cast(BH, tl.int64)
+    T_seq = tl.cast(T, tl.int64)
+    for tid in tl.range(core_id, task_num, num_core):
+        task_id = tl.cast(tid, tl.int64)
+        i_bh = task_id % BH_i64
+        i_tc = task_id // BH_i64
+        i_i = tl.cast(i_tc % NC, tl.int64)
+        i_t = tl.cast(i_tc // NC, tl.int64)
+        i_b, i_h = i_bh // H, i_bh % H
+        i_j = i_i
+        if IS_VARLEN:
+            i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
+            i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
+            bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+            eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+            T_cur = eos - bos
+        else:
+            bos = tl.cast(i_b, tl.int64) * T_seq
+            T_cur = T_seq
 
-    if i_t * BT + i_i * BC >= T:
-        return
+        if i_t * BT + i_i * BC < T_cur:
+            o_i = tl.arange(0, BC)
+            o_k = tl.arange(0, BK)
+            o_A = (i_t * BT + i_i * BC + tl.arange(0, BC)) * H * BT + i_j * BC
+            m_k = o_k < K
+            m_A = (i_t * BT + i_i * BC + tl.arange(0, BC)) < T_cur
 
-    o_i = tl.arange(0, BC)
-    o_k = tl.arange(0, BK)
-    o_A = (i_t * BT + i_i * BC + tl.arange(0, BC)) * H * BT + i_j * BC
-    m_k = o_k < K
-    m_A = (i_t * BT + i_i * BC + tl.arange(0, BC)) < T
+            q_ptr = q + (bos * H + i_h) * K
+            k_ptr = k + (bos * H + i_h) * K
+            g_ptr = g + (bos * H + i_h) * K
+            A_ptr = A + (bos * H + i_h) * BT
 
-    q_ptr = q + (bos * H + i_h) * K
-    k_ptr = k + (bos * H + i_h) * K
-    g_ptr = g + (bos * H + i_h) * K
-    A_ptr = A + (bos * H + i_h) * BT
+            o_c = i_t * BT + i_i * BC + tl.arange(0, BC)
+            m_qk = m_A[:, None] & m_k[None, :]
+            b_q = tl.load(q_ptr + o_c[:, None] * (H * K) + o_k[None, :], mask=m_qk, other=0.0).to(tl.float32)
+            b_g = tl.load(g_ptr + o_c[:, None] * (H * K) + o_k[None, :], mask=m_qk, other=0.0).to(tl.float32)
 
-    o_c = i_t * BT + i_i * BC + tl.arange(0, BC)
-    m_qk = m_A[:, None] & m_k[None, :]
-    b_q = tl.load(q_ptr + o_c[:, None] * (H * K) + o_k[None, :], mask=m_qk, other=0.0).to(tl.float32)
-    b_g = tl.load(g_ptr + o_c[:, None] * (H * K) + o_k[None, :], mask=m_qk, other=0.0).to(tl.float32)
-
-    # intra diagonal: fixed tl.static_range(BC) with a per-j active mask
-    max_j = min(BC, T - i_t * BT - i_i * BC)
-    for j in tl.static_range(BC):
-        active = j < max_j
-        b_k = tl.load(
-            k_ptr + (i_t * BT + i_j * BC + j) * H * K + o_k,
-            mask=m_k & active, other=0,
-        ).to(tl.float32)
-        b_gk = tl.load(
-            g_ptr + (i_t * BT + i_j * BC + j) * H * K + o_k,
-            mask=m_k & active, other=0,
-        ).to(tl.float32)
-        b_Aj = tl.sum(b_q * b_k[None, :] * exp2(b_g - b_gk[None, :]), 1) * scale
-        tl.store(A_ptr + o_A + j, b_Aj, mask=m_A & active)
-
-    tl.debug_barrier()
-    # zero entries above the causal diagonal in the BC×BC block
-    b_zero = tl.zeros([BC, BC], dtype=tl.float32)
-    tl.store(
-        A_ptr + o_A[:, None] + o_i,
-        b_zero,
-        mask=m_A[:, None] & (o_i[:, None] < o_i),
-    )
+            # intra diagonal: fixed tl.static_range(BC) with per-j causal masking
+            max_j = min(BC, T_cur - i_t * BT - i_i * BC)
+            for j in tl.static_range(BC):
+                active = j < max_j
+                b_k = tl.load(
+                    k_ptr + (i_t * BT + i_j * BC + j) * H * K + o_k,
+                    mask=m_k & active, other=0,
+                ).to(tl.float32)
+                b_gk = tl.load(
+                    g_ptr + (i_t * BT + i_j * BC + j) * H * K + o_k,
+                    mask=m_k & active, other=0,
+                ).to(tl.float32)
+                b_Aj = tl.sum(b_q * b_k[None, :] * exp2(b_g - b_gk[None, :]), 1) * scale
+                tl.store(A_ptr + o_A + j, b_Aj, mask=m_A & active & (o_i >= j))
 
 
 @triton.heuristics({'IS_VARLEN': lambda args: args['cu_seqlens'] is not None})
-@triton.jit(do_not_specialize=['T', 'NK_OFFSET', 'NTNC_OFFSET', 'BH_OFFSET'])
+@triton.jit(do_not_specialize=['T', 'NT', 'task_num', 'num_core', 'BH'])
 def chunk_gla_fwd_A_kernel_intra_sub_intra_split_npu(
     q, k, g, A, cu_seqlens, chunk_indices, scale, T,
     B: tl.constexpr, H: tl.constexpr, K: tl.constexpr,
     BT: tl.constexpr, BC: tl.constexpr, BK: tl.constexpr, NC: tl.constexpr,
-    IS_VARLEN: tl.constexpr, NK_OFFSET, NTNC_OFFSET, BH_OFFSET,
+    IS_VARLEN: tl.constexpr, NT, task_num, num_core, BH,
 ):
-    i_k = tl.program_id(0) + NK_OFFSET
-    i_tc = tl.program_id(1) + NTNC_OFFSET
-    i_bh = tl.program_id(2).to(tl.int64) + BH_OFFSET
-    i_b, i_h = i_bh // H, i_bh % H
-    i_t, i_i = (i_tc // NC).to(tl.int64), i_tc % NC
-    i_j = i_i
-    if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
-        all = T
-        T = eos - bos
-    else:
-        bos = tl.cast(i_b, tl.int64) * T
-        eos = bos + T
-        all = B * T
+    core_id = tl.program_id(0)
+    BH_i64 = tl.cast(BH, tl.int64)
+    NT_i64 = tl.cast(NT, tl.int64)
+    tasks_per_k = NT_i64 * NC
+    T_seq = tl.cast(T, tl.int64)
+    for tid in tl.range(core_id, task_num, num_core):
+        task_id = tl.cast(tid, tl.int64)
+        i_bh = task_id % BH_i64
+        i_kc = task_id // BH_i64
+        i_k = i_kc // tasks_per_k
+        i_tc = i_kc % tasks_per_k
+        i_t = tl.cast(i_tc // NC, tl.int64)
+        i_i = tl.cast(i_tc % NC, tl.int64)
+        i_b, i_h = i_bh // H, i_bh % H
+        i_j = i_i
+        if IS_VARLEN:
+            i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
+            i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
+            bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+            eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+            T_total = T_seq
+            T_cur = eos - bos
+        else:
+            bos = tl.cast(i_b, tl.int64) * T_seq
+            T_total = B * T_seq
+            T_cur = T_seq
 
-    if i_t * BT + i_i * BC >= T:
-        return
+        if i_t * BT + i_i * BC < T_cur:
+            o_i = tl.arange(0, BC)
+            o_k = i_k * BK + tl.arange(0, BK)
+            o_A = (i_t * BT + i_i * BC + tl.arange(0, BC)) * H * BC
+            m_k = o_k < K
+            m_A = (i_t * BT + i_i * BC + tl.arange(0, BC)) < T_cur
 
-    o_i = tl.arange(0, BC)
-    o_k = i_k * BK + tl.arange(0, BK)
-    o_A = (i_t * BT + i_i * BC + tl.arange(0, BC)) * H * BC
-    m_k = o_k < K
-    m_A = (i_t * BT + i_i * BC + tl.arange(0, BC)) < T
+            q_ptr = q + (bos * H + i_h) * K
+            k_ptr = k + (bos * H + i_h) * K
+            g_ptr = g + (bos * H + i_h) * K
+            A_ptr = A + ((i_k * T_total + bos) * H + i_h) * BC
 
-    q_ptr = q + (bos * H + i_h) * K
-    k_ptr = k + (bos * H + i_h) * K
-    g_ptr = g + (bos * H + i_h) * K
-    A_ptr = A + ((i_k * all + bos) * H + i_h) * BC
+            o_c = i_t * BT + i_i * BC + tl.arange(0, BC)
+            m_qk = m_A[:, None] & m_k[None, :]
+            b_q = tl.load(q_ptr + o_c[:, None] * (H * K) + o_k[None, :], mask=m_qk, other=0.0).to(tl.float32)
+            b_g = tl.load(g_ptr + o_c[:, None] * (H * K) + o_k[None, :], mask=m_qk, other=0.0).to(tl.float32)
 
-    o_c = i_t * BT + i_i * BC + tl.arange(0, BC)
-    m_qk = m_A[:, None] & m_k[None, :]
-    b_q = tl.load(q_ptr + o_c[:, None] * (H * K) + o_k[None, :], mask=m_qk, other=0.0).to(tl.float32)
-    b_g = tl.load(g_ptr + o_c[:, None] * (H * K) + o_k[None, :], mask=m_qk, other=0.0).to(tl.float32)
+            max_j = min(BC, T_cur - i_t * BT - i_i * BC)
+            for j in tl.static_range(BC):
+                active = j < max_j
+                b_k = tl.load(
+                    k_ptr + (i_t * BT + i_j * BC + j) * H * K + o_k,
+                    mask=m_k & active, other=0,
+                ).to(tl.float32)
+                b_gk = tl.load(
+                    g_ptr + (i_t * BT + i_j * BC + j) * H * K + o_k,
+                    mask=m_k & active, other=0,
+                ).to(tl.float32)
+                b_Aj = tl.sum(b_q * b_k[None, :] * exp2(b_g - b_gk[None, :]), 1) * scale
+                tl.store(A_ptr + o_A + j, b_Aj, mask=m_A & active)
 
-    max_j = min(BC, T - i_t * BT - i_i * BC)
-    for j in tl.static_range(BC):
-        active = j < max_j
-        b_k = tl.load(
-            k_ptr + (i_t * BT + i_j * BC + j) * H * K + o_k,
-            mask=m_k & active, other=0,
-        ).to(tl.float32)
-        b_gk = tl.load(
-            g_ptr + (i_t * BT + i_j * BC + j) * H * K + o_k,
-            mask=m_k & active, other=0,
-        ).to(tl.float32)
-        b_Aj = tl.sum(b_q * b_k[None, :] * exp2(b_g - b_gk[None, :]), 1) * scale
-        tl.store(A_ptr + o_A + j, b_Aj, mask=m_A & active)
-
-    tl.debug_barrier()
-    b_zero = tl.zeros([BC, BC], dtype=tl.float32)
-    tl.store(
-        A_ptr + o_A[:, None] + o_i,
-        b_zero,
-        mask=m_A[:, None] & (o_i[:, None] < o_i),
-    )
+            tl.debug_barrier()
+            b_zero = tl.zeros([BC, BC], dtype=tl.float32)
+            tl.store(
+                A_ptr + o_A[:, None] + o_i,
+                b_zero,
+                mask=m_A[:, None] & (o_i[:, None] < o_i),
+            )
 
 
 @triton.heuristics({'IS_VARLEN': lambda args: args['cu_seqlens'] is not None})
-@triton.jit(do_not_specialize=['T', 'NT_OFFSET', 'NC_OFFSET', 'BH_OFFSET'])
+@triton.jit(do_not_specialize=['T', 'task_num', 'num_core', 'BH'])
 def chunk_gla_fwd_A_kernel_intra_sub_intra_merge_npu(
     A, A2, cu_seqlens, chunk_indices, T,
-    B: tl.constexpr, H: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, NK: tl.constexpr,
-    IS_VARLEN: tl.constexpr, NT_OFFSET, NC_OFFSET, BH_OFFSET,
+    B: tl.constexpr, H: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, NK: tl.constexpr, NC: tl.constexpr,
+    IS_VARLEN: tl.constexpr, task_num, num_core, BH,
 ):
-    i_t = tl.program_id(0).to(tl.int64) + NT_OFFSET
-    i_c = tl.program_id(1) + NC_OFFSET
-    i_bh = tl.program_id(2).to(tl.int64) + BH_OFFSET
-    i_b, i_h = i_bh // H, i_bh % H
-    if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
-        all = T
-        T = eos - bos
-    else:
-        bos = tl.cast(i_b, tl.int64) * T
-        eos = bos + T
-        all = B * T
+    core_id = tl.program_id(0)
+    BH_i64 = tl.cast(BH, tl.int64)
+    T_seq = tl.cast(T, tl.int64)
+    for tid in tl.range(core_id, task_num, num_core):
+        task_id = tl.cast(tid, tl.int64)
+        i_bh = task_id % BH_i64
+        i_tc = task_id // BH_i64
+        i_c = tl.cast(i_tc % NC, tl.int64)
+        i_t = tl.cast(i_tc // NC, tl.int64)
+        i_b, i_h = i_bh // H, i_bh % H
+        if IS_VARLEN:
+            i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
+            i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
+            bos = tl.load(cu_seqlens + i_n).to(tl.int64)
+            eos = tl.load(cu_seqlens + i_n + 1).to(tl.int64)
+            T_total = T_seq
+            T_cur = eos - bos
+        else:
+            bos = tl.cast(i_b, tl.int64) * T_seq
+            T_total = B * T_seq
+            T_cur = T_seq
 
-    if i_t * BT + i_c * BC >= T:
-        return
-
-    b_A = tl.zeros([BC, BC], dtype=tl.float32)
-    o_c = i_t * BT + i_c * BC + tl.arange(0, BC)
-    o_i = tl.arange(0, BC)
-    m_c = o_c < T
-    m_A = m_c[:, None] & (o_i[None, :] < BC)
-    m_A2 = m_c[:, None] & ((i_c * BC + o_i)[None, :] < BT)
-    for i_k in range(0, NK):
-        p_A = A + (i_k * all + bos) * H * BC + i_h * BC + o_c[:, None] * (H * BC) + o_i[None, :]
-        b_A += tl.load(p_A, mask=m_A, other=0.0).to(tl.float32)
-    p_A2 = A2 + (bos * H + i_h) * BT + o_c[:, None] * (H * BT) + (i_c * BC + o_i)[None, :]
-    tl.store(p_A2, b_A.to(A2.dtype.element_ty), mask=m_A2)
+        if i_t * BT + i_c * BC < T_cur:
+            b_A = tl.zeros([BC, BC], dtype=tl.float32)
+            o_c = i_t * BT + i_c * BC + tl.arange(0, BC)
+            o_i = tl.arange(0, BC)
+            m_c = o_c < T_cur
+            m_A = m_c[:, None] & (o_i[None, :] < BC)
+            m_A2 = m_c[:, None] & ((i_c * BC + o_i)[None, :] < BT)
+            for i_k in range(0, NK):
+                p_A = A + (i_k * T_total + bos) * H * BC + i_h * BC + o_c[:, None] * (H * BC) + o_i[None, :]
+                b_A += tl.load(p_A, mask=m_A, other=0.0).to(tl.float32)
+            p_A2 = A2 + (bos * H + i_h) * BT + o_c[:, None] * (H * BT) + (i_c * BC + o_i)[None, :]
+            tl.store(p_A2, b_A.to(A2.dtype.element_ty), mask=m_A2)
 
 
 @input_guard
@@ -287,50 +302,62 @@ def chunk_gla_fwd_intra_gk_npu(
     base = dict(
         q=q, k=k, g=g, A=A, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
         scale=scale, T=T, H=H, K=K, BT=BT, BC=BC,
-        NT_OFFSET=0, NC_OFFSET=0, BH_OFFSET=0,
     )
-    launch_grid_chunked(
-        chunk_gla_fwd_A_kernel_intra_sub_inter_npu,
-        (NT, NC * NC, B * H),
-        offset_keys=('NT_OFFSET', 'NC_OFFSET', 'BH_OFFSET'),
-        kernel_kwargs={**base, 'BK': BK_inter, 'NC': NC},
+    num_core = get_npu_properties()['num_aicore']
+    task_num = NT * NC * B * H
+    chunk_gla_fwd_A_kernel_intra_sub_inter_npu[(num_core,)](
+        **base,
+        BK=BK_inter,
+        NC=NC,
+        task_num=task_num,
+        num_core=num_core,
+        BH=B * H,
+        IS_VARLEN=cu_seqlens is not None,
     )
     if K <= 256:
         BK_diag = max(triton.next_power_of_2(K), 16)
-        launch_grid_chunked(
-            chunk_gla_fwd_A_kernel_intra_sub_intra_npu,
-            (NT, NC, B * H),
-            offset_keys=('NT_OFFSET', 'NC_OFFSET', 'BH_OFFSET'),
-            kernel_kwargs={**base, 'BK': BK_diag},
+        num_vectorcore = get_npu_properties()['num_vectorcore']
+        task_num = NT * NC * B * H
+        chunk_gla_fwd_A_kernel_intra_sub_intra_npu[(num_vectorcore,)](
+            **base,
+            BK=BK_diag,
+            NC=NC,
+            task_num=task_num,
+            num_core=num_vectorcore,
+            BH=B * H,
+            IS_VARLEN=cu_seqlens is not None,
         )
     else:
         BK = min(128, triton.next_power_of_2(K))
         NK = triton.cdiv(K, BK)
+        num_vectorcore = get_npu_properties()['num_vectorcore']
         A_intra = q.new_zeros(NK, B, T, H, BC, dtype=torch.float)
         split_base = dict(
             q=q, k=k, g=g, A=A_intra, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
             scale=scale, T=T, B=B, H=H, K=K, BT=BT, BC=BC, BK=BK, NC=NC,
-            NK_OFFSET=0, NTNC_OFFSET=0, BH_OFFSET=0,
         )
-        launch_grid_chunked(
-            chunk_gla_fwd_A_kernel_intra_sub_intra_split_npu,
-            (NK, NT * NC, B * H),
-            offset_keys=('NK_OFFSET', 'NTNC_OFFSET', 'BH_OFFSET'),
-            quanta=(1, NC, 1),
-            kernel_kwargs=split_base,
-            compile_kwargs=_GLA_COMPILE_KWARGS,
+        split_task_num = NK * NT * NC * B * H
+        chunk_gla_fwd_A_kernel_intra_sub_intra_split_npu[(num_vectorcore,)](
+            **split_base,
+            NT=NT,
+            task_num=split_task_num,
+            num_core=num_vectorcore,
+            BH=B * H,
+            IS_VARLEN=cu_seqlens is not None,
+            **_GLA_COMPILE_KWARGS,
         )
         merge_base = dict(
             A=A_intra, A2=A, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
-            T=T, B=B, H=H, BT=BT, BC=BC, NK=NK,
-            NT_OFFSET=0, NC_OFFSET=0, BH_OFFSET=0,
+            T=T, B=B, H=H, BT=BT, BC=BC, NK=NK, NC=NC,
         )
-        launch_grid_chunked(
-            chunk_gla_fwd_A_kernel_intra_sub_intra_merge_npu,
-            (NT, NC, B * H),
-            offset_keys=('NT_OFFSET', 'NC_OFFSET', 'BH_OFFSET'),
-            kernel_kwargs=merge_base,
-            compile_kwargs=_GLA_COMPILE_KWARGS,
+        merge_task_num = NT * NC * B * H
+        chunk_gla_fwd_A_kernel_intra_sub_intra_merge_npu[(num_vectorcore,)](
+            **merge_base,
+            task_num=merge_task_num,
+            num_core=num_vectorcore,
+            BH=B * H,
+            IS_VARLEN=cu_seqlens is not None,
+            **_GLA_COMPILE_KWARGS,
         )
     return A
 
