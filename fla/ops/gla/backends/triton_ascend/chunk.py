@@ -533,7 +533,7 @@ def chunk_gla_fwd_o_gk_npu(
     else:
         total_chunks = len(chunk_indices)
 
-    o = torch.zeros_like(v)
+    o = torch.empty_like(v)
     BV = min(_FWD_O_BV, triton.next_power_of_2(V))
     NV = triton.cdiv(V, BV)
     num_core = get_npu_properties()['num_aicore']
