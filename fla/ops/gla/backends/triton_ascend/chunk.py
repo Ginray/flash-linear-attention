@@ -192,33 +192,32 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_npu(
             # Reuse the query-side gate factor across all historical rows.
             if K > 128:
                 b_q = b_q * exp2(b_g)
+                o_j = i_t * BT + i_i * BC + tl.arange(0, BC)
+                m_jk = (o_j < T_cur)[:, None] & m_k[None, :]
+                b_k_all = tl.load(
+                    k_ptr + o_j[:, None] * (H * K) + o_k[None, :],
+                    mask=m_jk, other=0,
+                ).to(tl.float32)
+                b_gk_all = tl.load(
+                    g_ptr + o_j[:, None] * (H * K) + o_k[None, :],
+                    mask=m_jk, other=0,
+                ).to(tl.float32)
+                b_kg_all = b_k_all * exp2(-b_gk_all)
 
             # intra diagonal: fixed tl.static_range(BC) with per-j causal masking
             # Emit each query row so key-column stores are contiguous.
             for i_r in tl.static_range(BC):
                 active = i_r < max_j
-                if K <= 128:
-                    b_q_r = tl.extract_slice(b_q, [i_r, 0], [1, BK], [1, 1])
-                    b_kg_r = tl.extract_slice(b_kg_all, [0, 0], [i_r + 1, BK], [1, 1])
-                    b_Ar = tl.sum(b_q_r * b_kg_r, 1) * scale
-                    o_j = tl.arange(0, i_r + 1)
-                    m_j = (i_t * BT + i_i * BC + o_j) < T_cur
-                    tl.store(
-                        A_ptr + (i_t * BT + i_i * BC + i_r) * H * BT + i_j * BC + o_j,
-                        b_Ar,
-                        mask=m_j & active,
-                    )
-                else:
-                    b_k = tl.load(
-                        k_ptr + (i_t * BT + i_j * BC + i_r) * H * K + o_k,
-                        mask=m_k & active, other=0,
-                    ).to(tl.float32)
-                    b_gk = tl.load(
-                        g_ptr + (i_t * BT + i_j * BC + i_r) * H * K + o_k,
-                        mask=m_k & active, other=0,
-                    ).to(tl.float32)
-                    b_Aj = tl.sum(b_q * (b_k * exp2(-b_gk))[None, :], 1) * scale
-                    tl.store(A_ptr + o_A + i_r, b_Aj, mask=m_A & active & (o_i >= i_r))
+                b_q_r = tl.extract_slice(b_q, [i_r, 0], [1, BK], [1, 1])
+                b_kg_r = tl.extract_slice(b_kg_all, [0, 0], [i_r + 1, BK], [1, 1])
+                b_Ar = tl.sum(b_q_r * b_kg_r, 1) * scale
+                o_j = tl.arange(0, i_r + 1)
+                m_j = (i_t * BT + i_i * BC + o_j) < T_cur
+                tl.store(
+                    A_ptr + (i_t * BT + i_i * BC + i_r) * H * BT + i_j * BC + o_j,
+                    b_Ar,
+                    mask=m_j & active,
+                )
 
 
 @triton.heuristics({'IS_VARLEN': lambda args: args['cu_seqlens'] is not None})
