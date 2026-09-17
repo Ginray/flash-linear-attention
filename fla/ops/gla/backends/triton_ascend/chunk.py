@@ -31,6 +31,7 @@ from fla.utils.ascend_ub_manager import (
 )
 
 _BC = 16
+_BC_FWD_K128 = 32
 _SAFETY_MARGIN = 0.80
 _FALLBACK = 16
 _MAX_TILE = 64
@@ -354,7 +355,9 @@ def chunk_gla_fwd_intra_gk_npu(
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
-    BC = min(_BC, BT)
+    # Wider forward sub-blocks reduce the number of small inter dot/sync steps;
+    # keep the smaller tile for K>128 to stay within the shared UB budget.
+    BC = min(_BC_FWD_K128 if K <= 128 else _BC, BT)
     NC = triton.cdiv(BT, BC)
     BK_inter = _get_bk(K)
 
