@@ -13,6 +13,14 @@ import torch
 import triton
 import triton.language as tl
 
+try:
+    from triton.language.extra.cann.extension import extract_slice
+
+    if not hasattr(tl, 'extract_slice'):
+        tl.extract_slice = extract_slice
+except ImportError:
+    pass
+
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp2
 from fla.utils import ascend_compile_kwargs, input_guard
@@ -26,7 +34,7 @@ _BC = 16
 _SAFETY_MARGIN = 0.80
 _FALLBACK = 16
 _MAX_TILE = 64
-_MAX_INTER_BK = 128
+_MAX_INTER_BK = 256
 
 # disable auto-multi-buffer on inter and K>256 intra-A split/merge launches
 _GLA_COMPILE_KWARGS = ascend_compile_kwargs()
@@ -69,35 +77,50 @@ def chunk_gla_fwd_A_kernel_intra_sub_inter_npu(
             o_i = i_t * BT + i_i * BC + tl.arange(0, BC)
             m_i = o_i < T_cur
 
-            for i_j in range(0, i_i):
-                b_A = tl.zeros([BC, BC], dtype=tl.float32)
-                o_j = i_t * BT + i_j * BC + tl.arange(0, BC)
-                m_j = o_j < T_cur
-                for i_k in range(tl.cdiv(K, BK)):
-                    o_k = i_k * BK + tl.arange(0, BK)
+            if i_i > 0:
+                if K <= BK:
+                    o_k = tl.arange(0, BK)
                     m_k = o_k < K
                     m_qk = m_i[:, None] & m_k[None, :]
-                    m_kj = m_k[:, None] & m_j[None, :]
-
                     p_q = q + (bos * H + i_h) * K + o_i[:, None] * (H * K) + o_k[None, :]
                     p_g = g + (bos * H + i_h) * K + o_i[:, None] * (H * K) + o_k[None, :]
-                    p_k = k + (bos * H + i_h) * K + o_k[:, None] + o_j[None, :] * (H * K)
-                    p_gk = g + (bos * H + i_h) * K + o_k[:, None] + o_j[None, :] * (H * K)
                     p_gn = g + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
-
                     b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)
                     b_q = tl.load(p_q, mask=m_qk, other=0.0).to(tl.float32)
                     b_g = tl.load(p_g, mask=m_qk, other=0.0).to(tl.float32)
                     b_qg = b_q * exp2(b_g - b_gn[None, :]) * scale
-                    b_k = tl.load(p_k, mask=m_kj, other=0.0).to(tl.float32)
-                    b_gk = tl.load(p_gk, mask=m_kj, other=0.0).to(tl.float32)
-                    b_kg = b_k * exp2(b_gn[:, None] - b_gk)
-                    b_A = tl.dot(b_qg, b_kg, b_A, allow_tf32=False)
+                for i_j in range(0, i_i):
+                    b_A = tl.zeros([BC, BC], dtype=tl.float32)
+                    o_j = i_t * BT + i_j * BC + tl.arange(0, BC)
+                    m_j = o_j < T_cur
+                    for i_k in range(tl.cdiv(K, BK)):
+                        o_k = i_k * BK + tl.arange(0, BK)
+                        m_k = o_k < K
+                        m_qk = m_i[:, None] & m_k[None, :]
+                        m_kj = m_k[:, None] & m_j[None, :]
 
-                o_jA = i_j * BC + tl.arange(0, BC)
-                m_A = m_i[:, None] & (o_jA[None, :] < BT)
-                p_A = A + (bos * H + i_h) * BT + o_i[:, None] * (H * BT) + o_jA[None, :]
-                tl.store(p_A, b_A.to(A.dtype.element_ty), mask=m_A)
+                        p_q = q + (bos * H + i_h) * K + o_i[:, None] * (H * K) + o_k[None, :]
+                        p_g = g + (bos * H + i_h) * K + o_i[:, None] * (H * K) + o_k[None, :]
+                        p_k = k + (bos * H + i_h) * K + o_k[:, None] + o_j[None, :] * (H * K)
+                        p_gk = g + (bos * H + i_h) * K + o_k[:, None] + o_j[None, :] * (H * K)
+
+                        if K > BK:
+                            p_q = q + (bos * H + i_h) * K + o_i[:, None] * (H * K) + o_k[None, :]
+                            p_g = g + (bos * H + i_h) * K + o_i[:, None] * (H * K) + o_k[None, :]
+                            p_gn = g + (bos + i_t * BT + i_i * BC) * H * K + i_h * K + o_k
+                            b_gn = tl.load(p_gn, mask=m_k, other=0).to(tl.float32)
+                            b_q = tl.load(p_q, mask=m_qk, other=0.0).to(tl.float32)
+                            b_g = tl.load(p_g, mask=m_qk, other=0.0).to(tl.float32)
+                            b_qg = b_q * exp2(b_g - b_gn[None, :]) * scale
+                        b_k = tl.load(p_k, mask=m_kj, other=0.0).to(tl.float32)
+                        b_gk = tl.load(p_gk, mask=m_kj, other=0.0).to(tl.float32)
+                        b_kg = b_k * exp2(b_gn[:, None] - b_gk)
+                        b_A = tl.dot(b_qg, b_kg, b_A, allow_tf32=False)
+
+                    o_jA = i_j * BC + tl.arange(0, BC)
+                    m_A = m_i[:, None] & (o_jA[None, :] < BT)
+                    p_A = A + (bos * H + i_h) * BT + o_i[:, None] * (H * BT) + o_jA[None, :]
+                    tl.store(p_A, b_A.to(A.dtype.element_ty), mask=m_A)
 
 
 @triton.heuristics({'IS_VARLEN': lambda args: args['cu_seqlens'] is not None})
@@ -145,20 +168,55 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_npu(
             b_q = tl.load(q_ptr + o_c[:, None] * (H * K) + o_k[None, :], mask=m_qk, other=0.0).to(tl.float32)
             b_g = tl.load(g_ptr + o_c[:, None] * (H * K) + o_k[None, :], mask=m_qk, other=0.0).to(tl.float32)
 
-            # intra diagonal: fixed tl.static_range(BC) with per-j causal masking
             max_j = min(BC, T_cur - i_t * BT - i_i * BC)
+            if K <= 128:
+                p_g_first = g_ptr + (i_t * BT + i_i * BC) * (H * K) + o_k
+                p_g_last = g_ptr + (i_t * BT + i_i * BC + max_j - 1) * (H * K) + o_k
+                b_g_first = tl.load(p_g_first, mask=m_k, other=0.0).to(tl.float32)
+                b_g_last = tl.load(p_g_last, mask=m_k, other=0.0).to(tl.float32)
+                b_g_ref = (b_g_first + b_g_last) * 0.5
+                b_q = b_q * exp2(b_g - b_g_ref[None, :])
+
+                o_j = i_t * BT + i_i * BC + tl.arange(0, BC)
+                m_jk = (o_j < T_cur)[:, None] & m_k[None, :]
+                b_k_all = tl.load(
+                    k_ptr + o_j[:, None] * (H * K) + o_k[None, :],
+                    mask=m_jk, other=0,
+                ).to(tl.float32)
+                b_gk_all = tl.load(
+                    g_ptr + o_j[:, None] * (H * K) + o_k[None, :],
+                    mask=m_jk, other=0,
+                ).to(tl.float32)
+                b_kg_all = b_k_all * exp2(b_g_ref[None, :] - b_gk_all)
+            # Reuse the query-side gate factor across all historical rows.
+            if K > 128:
+                b_q = b_q * exp2(b_g)
+
+            # intra diagonal: fixed tl.static_range(BC) with per-j causal masking
             for j in tl.static_range(BC):
                 active = j < max_j
-                b_k = tl.load(
-                    k_ptr + (i_t * BT + i_j * BC + j) * H * K + o_k,
-                    mask=m_k & active, other=0,
-                ).to(tl.float32)
-                b_gk = tl.load(
-                    g_ptr + (i_t * BT + i_j * BC + j) * H * K + o_k,
-                    mask=m_k & active, other=0,
-                ).to(tl.float32)
-                b_Aj = tl.sum(b_q * b_k[None, :] * exp2(b_g - b_gk[None, :]), 1) * scale
-                tl.store(A_ptr + o_A + j, b_Aj, mask=m_A & active & (o_i >= j))
+                if K <= 128:
+                    b_kg = tl.extract_slice(b_kg_all, [j, 0], [1, BK], [1, 1])
+                    b_q_j = tl.extract_slice(b_q, [j, 0], [BC - j, BK], [1, 1])
+                    b_Aj = tl.sum(b_q_j * b_kg, 1) * scale
+                    o_j = tl.arange(0, BC - j)
+                    m_j = (i_t * BT + i_i * BC + j + o_j) < T_cur
+                    tl.store(
+                        A_ptr + (i_t * BT + i_i * BC + j + o_j) * H * BT + i_j * BC + j,
+                        b_Aj,
+                        mask=m_j & active,
+                    )
+                else:
+                    b_k = tl.load(
+                        k_ptr + (i_t * BT + i_j * BC + j) * H * K + o_k,
+                        mask=m_k & active, other=0,
+                    ).to(tl.float32)
+                    b_gk = tl.load(
+                        g_ptr + (i_t * BT + i_j * BC + j) * H * K + o_k,
+                        mask=m_k & active, other=0,
+                    ).to(tl.float32)
+                    b_Aj = tl.sum(b_q * (b_k * exp2(-b_gk))[None, :], 1) * scale
+                    tl.store(A_ptr + o_A + j, b_Aj, mask=m_A & active & (o_i >= j))
 
 
 @triton.heuristics({'IS_VARLEN': lambda args: args['cu_seqlens'] is not None})
