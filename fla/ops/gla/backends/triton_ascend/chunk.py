@@ -356,7 +356,7 @@ def chunk_gla_fwd_intra_gk_npu(
     NC = triton.cdiv(BT, BC)
     BK_inter = _get_bk(K)
 
-    A = q.new_zeros(B, T, H, BT, dtype=torch.float)
+    A = q.new_empty(B, T, H, BT, dtype=torch.float)
     base = dict(
         q=q, k=k, g=g, A=A, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
         scale=scale, T=T, H=H, K=K, BT=BT, BC=BC,
