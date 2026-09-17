@@ -287,14 +287,6 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_split_npu(
                 b_Aj = tl.sum(b_q * b_k[None, :] * exp2(b_g - b_gk[None, :]), 1) * scale
                 tl.store(A_ptr + o_A + j, b_Aj, mask=m_A & active)
 
-            tl.debug_barrier()
-            b_zero = tl.zeros([BC, BC], dtype=tl.float32)
-            tl.store(
-                A_ptr + o_A[:, None] + o_i,
-                b_zero,
-                mask=m_A[:, None] & (o_i[:, None] < o_i),
-            )
-
 
 @triton.heuristics({'IS_VARLEN': lambda args: args['cu_seqlens'] is not None})
 @triton.jit(do_not_specialize=['T', 'task_num', 'num_core', 'BH'])
@@ -330,8 +322,11 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_merge_npu(
             o_c = i_t * BT + i_c * BC + tl.arange(0, BC)
             o_i = tl.arange(0, BC)
             m_c = o_c < T_cur
-            m_A = m_c[:, None] & (o_i[None, :] < BC)
-            m_A2 = m_c[:, None] & ((i_c * BC + o_i)[None, :] < BT)
+            o_col = i_c * BC + o_i
+            m_lower = o_c[:, None] >= (i_t * BT + o_col)[None, :]
+            m_col = o_col < BT
+            m_A = m_c[:, None] & m_col[None, :] & m_lower
+            m_A2 = m_A
             for i_k in range(0, NK):
                 p_A = A + (i_k * T_total + bos) * H * BC + i_h * BC + o_c[:, None] * (H * BC) + o_i[None, :]
                 b_A += tl.load(p_A, mask=m_A, other=0.0).to(tl.float32)
@@ -394,7 +389,7 @@ def chunk_gla_fwd_intra_gk_npu(
         BK = min(128, triton.next_power_of_2(K))
         NK = triton.cdiv(K, BK)
         num_vectorcore = get_npu_properties()['num_vectorcore']
-        A_intra = q.new_zeros(NK, B, T, H, BC, dtype=torch.float)
+        A_intra = q.new_empty(NK, B, T, H, BC, dtype=torch.float)
         split_base = dict(
             q=q, k=k, g=g, A=A_intra, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
             scale=scale, T=T, B=B, H=H, K=K, BT=BT, BC=BC, BK=BK, NC=NC,
