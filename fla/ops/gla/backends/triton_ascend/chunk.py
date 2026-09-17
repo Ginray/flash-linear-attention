@@ -26,6 +26,7 @@ _BC = 16
 _SAFETY_MARGIN = 0.80
 _FALLBACK = 16
 _MAX_TILE = 64
+_MAX_INTER_BK = 128
 
 # disable auto-multi-buffer on inter and K>256 intra-A split/merge launches
 _GLA_COMPILE_KWARGS = ascend_compile_kwargs()
@@ -35,7 +36,7 @@ def _get_bk(K: int) -> int:
     return compute_row_tile_block_size(
         _BC, K, 6.0, tiling_row=False, safety_margin=_SAFETY_MARGIN,
         fallback=_FALLBACK, min_block=16,
-        max_block=min(64, max(16, triton.next_power_of_2(K))),
+        max_block=min(_MAX_INTER_BK, max(16, triton.next_power_of_2(K))),
     )
 
 
