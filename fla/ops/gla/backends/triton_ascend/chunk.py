@@ -256,9 +256,7 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_split_npu(
             T_cur = T_seq
 
         if i_t * BT + i_i * BC < T_cur:
-            o_i = tl.arange(0, BC)
             o_k = i_k * BK + tl.arange(0, BK)
-            o_A = (i_t * BT + i_i * BC + tl.arange(0, BC)) * H * BC
             m_k = o_k < K
             m_A = (i_t * BT + i_i * BC + tl.arange(0, BC)) < T_cur
 
@@ -273,18 +271,29 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_split_npu(
             b_g = tl.load(g_ptr + o_c[:, None] * (H * K) + o_k[None, :], mask=m_qk, other=0.0).to(tl.float32)
 
             max_j = min(BC, T_cur - i_t * BT - i_i * BC)
-            for j in tl.static_range(BC):
-                active = j < max_j
-                b_k = tl.load(
-                    k_ptr + (i_t * BT + i_j * BC + j) * H * K + o_k,
-                    mask=m_k & active, other=0,
-                ).to(tl.float32)
-                b_gk = tl.load(
-                    g_ptr + (i_t * BT + i_j * BC + j) * H * K + o_k,
-                    mask=m_k & active, other=0,
-                ).to(tl.float32)
-                b_Aj = tl.sum(b_q * b_k[None, :] * exp2(b_g - b_gk[None, :]), 1) * scale
-                tl.store(A_ptr + o_A + j, b_Aj, mask=m_A & active)
+            b_qg = b_q * exp2(b_g)
+            o_j = i_t * BT + i_i * BC + tl.arange(0, BC)
+            m_jk = (o_j < T_cur)[:, None] & m_k[None, :]
+            b_k_all = tl.load(
+                k_ptr + o_j[:, None] * (H * K) + o_k[None, :],
+                mask=m_jk, other=0,
+            ).to(tl.float32)
+            b_gk_all = tl.load(
+                g_ptr + o_j[:, None] * (H * K) + o_k[None, :],
+                mask=m_jk, other=0,
+            ).to(tl.float32)
+            b_kg_all = b_k_all * exp2(-b_gk_all)
+            for i_r in tl.static_range(BC):
+                active = i_r < max_j
+                b_q_r = tl.extract_slice(b_qg, [i_r, 0], [1, BK], [1, 1])
+                b_kg_r = tl.extract_slice(b_kg_all, [0, 0], [i_r + 1, BK], [1, 1])
+                b_Ar = tl.sum(b_q_r * b_kg_r, 1) * scale
+                o_j = tl.arange(0, i_r + 1)
+                tl.store(
+                    A_ptr + (i_t * BT + i_i * BC + i_r) * H * BC + o_j,
+                    b_Ar,
+                    mask=(o_j < max_j) & active,
+                )
 
 
 @triton.heuristics({'IS_VARLEN': lambda args: args['cu_seqlens'] is not None})
