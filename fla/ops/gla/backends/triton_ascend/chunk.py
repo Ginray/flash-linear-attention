@@ -852,12 +852,9 @@ def chunk_gla_bwd_kernel_intra_npu(
             k + (bos + i_t * BT + i_i * BC + j) * H * K + i_h * K + o_k,
             mask=m_k & active, other=0,
         ).to(tl.float32)
-        b_gkj = tl.load(
-            g + (bos + i_t * BT + i_i * BC + j) * H * K + i_h * K + o_k,
-            mask=m_k & active, other=0,
-        ).to(tl.float32)
+        b_gkj = tl.extract_slice(b_g, [j, 0], [1, BK], [1, 1])
         m_i = o_i[:, None] >= j
-        b_dq += tl.where(m_i & active, b_dAj[:, None] * b_kj[None, :] * exp2(b_g - b_gkj[None, :]), 0.)
+        b_dq += tl.where(m_i & active, b_dAj[:, None] * b_kj[None, :] * exp2(b_g - b_gkj), 0.)
 
     tl.store(
         dq + (bos * H + i_h) * K + o_c[:, None] * (H * K) + o_k[None, :],
@@ -900,12 +897,9 @@ def chunk_gla_bwd_kernel_intra_npu(
             q + (bos + i_t * BT + i_i * BC + j) * H * K + i_h * K + o_k,
             mask=m_k & active, other=0,
         ).to(tl.float32)
-        b_gqj = tl.load(
-            g + (bos + i_t * BT + i_i * BC + j) * H * K + i_h * K + o_k,
-            mask=m_k & active, other=0,
-        ).to(tl.float32)
+        b_gqj = tl.extract_slice(b_g, [j, 0], [1, BK], [1, 1])
         m_i = o_i[:, None] <= j
-        b_dk += tl.where(m_i & active, b_dAj[:, None] * b_qj[None, :] * exp2(b_gqj[None, :] - b_g), 0.)
+        b_dk += tl.where(m_i & active, b_dAj[:, None] * b_qj[None, :] * exp2(b_gqj - b_g), 0.)
 
     tl.store(
         dk + (bos * H + i_h) * K + o_c[:, None] * (H * K) + o_k[None, :],
