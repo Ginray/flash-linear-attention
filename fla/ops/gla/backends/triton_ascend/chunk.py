@@ -1052,9 +1052,9 @@ def chunk_gla_bwd_dqkg_npu(
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK, BV = _bwd_pick_bk(K), _bwd_pick_bv(V)
-    dg = torch.zeros_like(g)
-    dq2 = torch.zeros_like(dq)
-    dk2 = torch.zeros_like(dk)
+    dg = torch.empty_like(g)
+    dq2 = torch.empty_like(dq)
+    dk2 = torch.empty_like(dk)
     launch_grid_chunked(
         chunk_gla_bwd_kernel_inter_npu,
         (triton.cdiv(K, BK), NT, B * H),
