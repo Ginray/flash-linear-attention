@@ -30,13 +30,18 @@ from fla.utils.ascend_ub_manager import (
     launch_grid_chunked,
 )
 
+# base sub-block used by the default forward and backward paths
 _BC = 16
+# the wider forward sub-block is only used in the validated K<=128 regime
 _BC_FWD_K128 = 32
+# reserve UB headroom for live intermediates and compiler-generated temporaries
 _SAFETY_MARGIN = 0.80
+# conservative tile used when the UB-based calculation has no result
 _FALLBACK = 16
+# shared cap for backward K/V tiles; inter forward uses its own cap below
 _MAX_TILE = 64
+# largest inter K tile validated on the current Ascend compiler and hardware
 _MAX_INTER_BK = 256
-
 # disable auto-multi-buffer on inter and K>256 intra-A split/merge launches
 _GLA_COMPILE_KWARGS = ascend_compile_kwargs()
 
@@ -189,9 +194,7 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_npu(
                     mask=m_jk, other=0,
                 ).to(tl.float32)
                 b_kg_all = b_k_all * exp2(b_g_ref[None, :] - b_gk_all)
-            # Reuse the query-side gate factor across all historical rows.
             if K > 128:
-                b_q = b_q * exp2(b_g)
                 o_j = i_t * BT + i_i * BC + tl.arange(0, BC)
                 m_jk = (o_j < T_cur)[:, None] & m_k[None, :]
                 b_k_all = tl.load(
@@ -202,15 +205,20 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_npu(
                     g_ptr + o_j[:, None] * (H * K) + o_k[None, :],
                     mask=m_jk, other=0,
                 ).to(tl.float32)
-                b_kg_all = b_k_all * exp2(-b_gk_all)
 
             # intra diagonal: fixed tl.static_range(BC) with per-j causal masking
             # Emit each query row so key-column stores are contiguous.
             for i_r in tl.static_range(BC):
                 active = i_r < max_j
                 b_q_r = tl.extract_slice(b_q, [i_r, 0], [1, BK], [1, 1])
-                b_kg_r = tl.extract_slice(b_kg_all, [0, 0], [i_r + 1, BK], [1, 1])
-                b_Ar = tl.sum(b_q_r * b_kg_r, 1) * scale
+                if K <= 128:
+                    b_kg_r = tl.extract_slice(b_kg_all, [0, 0], [i_r + 1, BK], [1, 1])
+                    b_Ar = tl.sum(b_q_r * b_kg_r, 1) * scale
+                else:
+                    b_g_r = tl.extract_slice(b_g, [i_r, 0], [1, BK], [1, 1])
+                    b_k_r = tl.extract_slice(b_k_all, [0, 0], [i_r + 1, BK], [1, 1])
+                    b_gk_r = tl.extract_slice(b_gk_all, [0, 0], [i_r + 1, BK], [1, 1])
+                    b_Ar = tl.sum(b_q_r * b_k_r * exp2(b_g_r - b_gk_r), 1) * scale
                 o_j = tl.arange(0, i_r + 1)
                 m_j = (i_t * BT + i_i * BC + o_j) < T_cur
                 tl.store(
@@ -271,7 +279,6 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_split_npu(
             b_g = tl.load(g_ptr + o_c[:, None] * (H * K) + o_k[None, :], mask=m_qk, other=0.0).to(tl.float32)
 
             max_j = min(BC, T_cur - i_t * BT - i_i * BC)
-            b_qg = b_q * exp2(b_g)
             o_j = i_t * BT + i_i * BC + tl.arange(0, BC)
             m_jk = (o_j < T_cur)[:, None] & m_k[None, :]
             b_k_all = tl.load(
@@ -282,12 +289,13 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_split_npu(
                 g_ptr + o_j[:, None] * (H * K) + o_k[None, :],
                 mask=m_jk, other=0,
             ).to(tl.float32)
-            b_kg_all = b_k_all * exp2(-b_gk_all)
             for i_r in tl.static_range(BC):
                 active = i_r < max_j
-                b_q_r = tl.extract_slice(b_qg, [i_r, 0], [1, BK], [1, 1])
-                b_kg_r = tl.extract_slice(b_kg_all, [0, 0], [i_r + 1, BK], [1, 1])
-                b_Ar = tl.sum(b_q_r * b_kg_r, 1) * scale
+                b_q_r = tl.extract_slice(b_q, [i_r, 0], [1, BK], [1, 1])
+                b_g_r = tl.extract_slice(b_g, [i_r, 0], [1, BK], [1, 1])
+                b_k_r = tl.extract_slice(b_k_all, [0, 0], [i_r + 1, BK], [1, 1])
+                b_gk_r = tl.extract_slice(b_gk_all, [0, 0], [i_r + 1, BK], [1, 1])
+                b_Ar = tl.sum(b_q_r * b_k_r * exp2(b_g_r - b_gk_r), 1) * scale
                 o_j = tl.arange(0, i_r + 1)
                 tl.store(
                     A_ptr + (i_t * BT + i_i * BC + i_r) * H * BC + o_j,
@@ -331,8 +339,10 @@ def chunk_gla_fwd_A_kernel_intra_sub_intra_merge_npu(
             o_i = tl.arange(0, BC)
             m_c = o_c < T_cur
             o_col = i_c * BC + o_i
+            # Split keeps contiguous full-tile stores; only the causal lower triangle is valid.
             m_lower = o_c[:, None] >= (i_t * BT + o_col)[None, :]
             m_col = o_col < BT
+            # A_intra's upper triangle is intentionally uninitialized and must not be read.
             m_A = m_c[:, None] & m_col[None, :] & m_lower
             m_A2 = m_A
             for i_k in range(0, NK):
@@ -370,12 +380,11 @@ def chunk_gla_fwd_intra_gk_npu(
         scale=scale, T=T, H=H, K=K, BT=BT, BC=BC,
     )
     num_core = get_npu_properties()['num_aicore']
-    task_num = NT * NC * B * H
     chunk_gla_fwd_A_kernel_intra_sub_inter_npu[(num_core,)](
         **base,
         BK=BK_inter,
         NC=NC,
-        task_num=task_num,
+        task_num=NT * NC * B * H,
         num_core=num_core,
         BH=B * H,
         IS_VARLEN=cu_seqlens is not None,
@@ -397,6 +406,7 @@ def chunk_gla_fwd_intra_gk_npu(
         BK = min(128, triton.next_power_of_2(K))
         NK = triton.cdiv(K, BK)
         num_vectorcore = get_npu_properties()['num_vectorcore']
+        # Split writes full contiguous tiles; merge masks the unused upper triangle.
         A_intra = q.new_empty(NK, B, T, H, BC, dtype=torch.float)
         split_base = dict(
             q=q, k=k, g=g, A=A_intra, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
