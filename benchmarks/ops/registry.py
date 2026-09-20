@@ -707,23 +707,11 @@ register_op(OpConfig(
 
 # --- Additional implementation variants for profiling ---
 
-# Recurrent kernels serve short-sequence / decode-style workloads. Keep this
-# sweep conservative so `--op all` does not fail on unsupported large tiles.
-_recurrent_default_shapes = {
-    'B1_T1_H8_D64':    {'B': 1, 'T': 1,  'H': 8,  'D': 64},
-    'B8_T1_H8_D128':   {'B': 8, 'T': 1,  'H': 8,  'D': 128},
-    'B1_T16_H8_D128':  {'B': 1, 'T': 16, 'H': 8,  'D': 128},
-    'B4_T16_H8_D128':  {'B': 4, 'T': 16, 'H': 8,  'D': 128},
-    'B1_T64_H8_D128':  {'B': 1, 'T': 64, 'H': 8,  'D': 128},
-    'B4_T64_H8_D64':   {'B': 4, 'T': 64, 'H': 8,  'D': 64},
-}
-
 register_op(OpConfig(
     name='fused_recurrent_retention',
     import_path='fla.ops.retention',
     inputs={**_simple_qkv},
     category='simple_qkv',
-    default_shapes=_recurrent_default_shapes,
 ))
 
 register_op(OpConfig(
@@ -732,7 +720,6 @@ register_op(OpConfig(
     inputs={**_simple_qkv},
     extra_kwargs={'normalize': True},
     category='simple_qkv',
-    default_shapes=_recurrent_default_shapes,
 ))
 
 register_op(OpConfig(
@@ -743,7 +730,6 @@ register_op(OpConfig(
         'gk': TensorSpec(shape_BTHD, transform=logsigmoid_clamp),
     },
     category='elem_gate',
-    default_shapes=_recurrent_default_shapes,
 ))
 
 register_op(OpConfig(
@@ -754,7 +740,6 @@ register_op(OpConfig(
         'beta': TensorSpec(shape_BTH, transform=sigmoid_transform),
     },
     category='beta',
-    default_shapes=_recurrent_default_shapes,
     test_file='tests/ops/test_delta.py',
 ))
 
@@ -769,7 +754,6 @@ register_op(OpConfig(
     },
     extra_kwargs={'use_qk_l2norm_in_kernel': True},
     category='gate_beta',
-    default_shapes=_recurrent_default_shapes,
     test_file='tests/ops/test_gdn.py',
 ))
 
@@ -785,7 +769,6 @@ register_op(OpConfig(
     extra_kwargs={'use_qk_l2norm_in_kernel': True},
     skip_backward=True,
     category='gate_beta',
-    default_shapes=_recurrent_default_shapes,
     test_file='tests/ops/test_gdn2.py',
 ))
 
@@ -800,7 +783,6 @@ register_op(OpConfig(
     extra_kwargs={'use_qk_l2norm_in_kernel': True},
     skip_backward=True,
     category='gate_beta',
-    default_shapes=_recurrent_default_shapes,
     test_file='tests/ops/test_kda.py',
 ))
 
@@ -812,6 +794,5 @@ register_op(OpConfig(
         'g': TensorSpec(shape_BTH, transform=logsigmoid),
     },
     category='head_gate',
-    default_shapes=_recurrent_default_shapes,
 ))
 
