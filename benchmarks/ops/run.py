@@ -352,12 +352,16 @@ def benchmark_op(
             out_tensor = out[0] if config.output_is_tuple else out
             do = torch.randn_like(out_tensor)
 
+            def _fwd_fn(inputs=inputs):
+                return op_fn(**inputs, **call_kwargs)
+
             def _fwdbwd_fn(inputs=inputs, do=do):
                 result = op_fn(**inputs, **call_kwargs)
                 t = result[0] if config.output_is_tuple else result
                 t.backward(do)
 
-            _warmup_autotune(_fwdbwd_fn, device=device_name)
+            warmup_fn = _fwdbwd_fn if 'fwdbwd' in modes else _fwd_fn
+            _warmup_autotune(warmup_fn, device=device_name)
         except Exception as e:
             logger.warning(f"Warmup failed for {op_name} @ {shape_name}: {e}")
             failed_shapes.add(shape_name)
