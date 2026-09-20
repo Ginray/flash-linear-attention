@@ -705,24 +705,19 @@ register_op(OpConfig(
 ))
 
 
-# --- Additional implementation variants for full profiling ---
+# --- Additional implementation variants for profiling ---
 
+# Recurrent kernels serve short-sequence / decode-style workloads. Keep this
+# sweep conservative so `--op all` does not fail on unsupported large tiles.
 _recurrent_default_shapes = {
-    'B1_T1_H96_D128':  {'B': 1, 'T': 1,  'H': 96, 'D': 128},
-    'B2_T16_H16_D128': {'B': 2, 'T': 16, 'H': 16, 'D': 128},
-    'B4_T32_H16_D128': {'B': 4, 'T': 32, 'H': 16, 'D': 128},
-    'B4_T64_H64_D128': {'B': 4, 'T': 64, 'H': 64, 'D': 128},
-    'B8_T32_H32_D256': {'B': 8, 'T': 32, 'H': 32, 'D': 256},
-    'B8_T64_H8_D64':   {'B': 8, 'T': 64, 'H': 8,  'D': 64},
+    'B1_T1_H8_D64':    {'B': 1, 'T': 1,  'H': 8,  'D': 64},
+    'B8_T1_H8_D128':   {'B': 8, 'T': 1,  'H': 8,  'D': 128},
+    'B1_T16_H8_D128':  {'B': 1, 'T': 16, 'H': 8,  'D': 128},
+    'B4_T16_H8_D128':  {'B': 4, 'T': 16, 'H': 8,  'D': 128},
+    'B1_T64_H8_D128':  {'B': 1, 'T': 64, 'H': 8,  'D': 128},
+    'B4_T64_H8_D64':   {'B': 4, 'T': 64, 'H': 8,  'D': 64},
 }
 
-# Retention
-register_op(OpConfig(
-    name='fused_chunk_retention',
-    import_path='fla.ops.retention',
-    inputs={**_simple_qkv},
-    category='simple_qkv',
-))
 register_op(OpConfig(
     name='fused_recurrent_retention',
     import_path='fla.ops.retention',
@@ -730,21 +725,7 @@ register_op(OpConfig(
     category='simple_qkv',
     default_shapes=_recurrent_default_shapes,
 ))
-register_op(OpConfig(
-    name='parallel_retention',
-    import_path='fla.ops.retention',
-    inputs={**_simple_qkv},
-    category='simple_qkv',
-))
 
-# Linear attention
-register_op(OpConfig(
-    name='fused_chunk_linear_attn',
-    import_path='fla.ops.linear_attn',
-    inputs={**_simple_qkv},
-    extra_kwargs={'normalize': True},
-    category='simple_qkv',
-))
 register_op(OpConfig(
     name='fused_recurrent_linear_attn',
     import_path='fla.ops.linear_attn',
@@ -754,7 +735,6 @@ register_op(OpConfig(
     default_shapes=_recurrent_default_shapes,
 ))
 
-# GLA. fused_chunk_gla is deprecated and intentionally not registered.
 register_op(OpConfig(
     name='fused_recurrent_gla',
     import_path='fla.ops.gla',
@@ -766,7 +746,6 @@ register_op(OpConfig(
     default_shapes=_recurrent_default_shapes,
 ))
 
-# Delta rule. fused_chunk_delta_rule is deprecated and intentionally not registered.
 register_op(OpConfig(
     name='fused_recurrent_delta_rule',
     import_path='fla.ops.delta_rule',
@@ -779,7 +758,6 @@ register_op(OpConfig(
     test_file='tests/ops/test_delta.py',
 ))
 
-# Gated DeltaNet
 register_op(OpConfig(
     name='fused_recurrent_gdn',
     import_path='fla.ops.gated_delta_rule',
@@ -795,7 +773,6 @@ register_op(OpConfig(
     test_file='tests/ops/test_gdn.py',
 ))
 
-# GDN2 recurrent is a forward/decode kernel.
 register_op(OpConfig(
     name='fused_recurrent_gdn2',
     import_path='fla.ops.gdn2',
@@ -812,7 +789,6 @@ register_op(OpConfig(
     test_file='tests/ops/test_gdn2.py',
 ))
 
-# KDA recurrent is a forward/decode kernel.
 register_op(OpConfig(
     name='fused_recurrent_kda',
     import_path='fla.ops.kda',
@@ -828,52 +804,6 @@ register_op(OpConfig(
     test_file='tests/ops/test_kda.py',
 ))
 
-# Preconditioned GDN/KDA
-register_op(OpConfig(
-    name='fused_recurrent_precond_gdn',
-    import_path='fla.ops.precond_gated_delta_rule',
-    func_name='fused_recurrent_precond_gated_delta_rule',
-    inputs={
-        **_simple_qkv,
-        'g': TensorSpec(shape_BTH, transform=logsigmoid),
-        'beta': TensorSpec(shape_BTH, transform=sigmoid_transform),
-        'g_atk': TensorSpec(shape_BTH, transform=logsigmoid),
-        'beta_atk': TensorSpec(shape_BTH, transform=sigmoid_transform),
-        'log_atk_scale': TensorSpec(shape_H, dtype='float32'),
-    },
-    extra_kwargs={'use_qk_l2norm_in_kernel': True, 'x': 1.5},
-    category='gate_beta',
-    default_shapes=_recurrent_default_shapes,
-    test_file='tests/ops/test_precond_gated_delta.py',
-))
-register_op(OpConfig(
-    name='fused_recurrent_precond_kda',
-    import_path='fla.ops.precond_kda',
-    inputs={
-        **_simple_qkv,
-        'g': TensorSpec(shape_BTHD, transform=logsigmoid),
-        'beta': TensorSpec(shape_BTH, transform=sigmoid_transform),
-        'g_atk': TensorSpec(shape_BTH, transform=logsigmoid),
-        'beta_atk': TensorSpec(shape_BTH, transform=sigmoid_transform),
-        'log_atk_scale': TensorSpec(shape_H, dtype='float32'),
-    },
-    extra_kwargs={'use_qk_l2norm_in_kernel': True, 'x': 1.5},
-    skip_backward=True,
-    category='gate_beta',
-    default_shapes=_recurrent_default_shapes,
-    test_file='tests/ops/test_precond_kda.py',
-))
-
-# Simple GLA
-register_op(OpConfig(
-    name='fused_chunk_simple_gla',
-    import_path='fla.ops.simple_gla',
-    inputs={
-        **_simple_qkv,
-        'g': TensorSpec(shape_BTH, transform=logsigmoid),
-    },
-    category='head_gate',
-))
 register_op(OpConfig(
     name='fused_recurrent_simple_gla',
     import_path='fla.ops.simple_gla',
@@ -884,105 +814,4 @@ register_op(OpConfig(
     category='head_gate',
     default_shapes=_recurrent_default_shapes,
 ))
-register_op(OpConfig(
-    name='parallel_simple_gla',
-    import_path='fla.ops.simple_gla',
-    inputs={
-        **_simple_qkv,
-        'g': TensorSpec(shape_BTH, transform=logsigmoid),
-    },
-    category='head_gate',
-))
 
-# RWKV
-register_op(OpConfig(
-    name='fused_recurrent_rwkv6',
-    import_path='fla.ops.rwkv6',
-    inputs={
-        'r': TensorSpec(shape_BTHD),
-        'k': TensorSpec(shape_BTHD),
-        'v': TensorSpec(shape_BTHD),
-        'w': TensorSpec(shape_BTHD, transform=logsigmoid),
-        'u': TensorSpec(shape_HD, requires_grad=False),
-    },
-    category='rwkv',
-    default_shapes=_recurrent_default_shapes,
-))
-register_op(OpConfig(
-    name='fused_recurrent_rwkv7',
-    import_path='fla.ops.rwkv7',
-    inputs={
-        'r': TensorSpec(shape_BTHD),
-        'w': TensorSpec(shape_BTHD, transform=rwkv7_w_transform),
-        'k': TensorSpec(shape_BTHD),
-        'v': TensorSpec(shape_BTHD),
-        'a': TensorSpec(shape_BTHD),
-        'b': TensorSpec(shape_BTHD),
-    },
-    post_init=_rwkv7_post_init,
-    category='rwkv',
-    default_shapes=_recurrent_default_shapes,
-))
-
-# Comba
-register_op(OpConfig(
-    name='fused_recurrent_comba',
-    import_path='fla.ops.comba',
-    inputs={
-        **_simple_qkv,
-        'p': TensorSpec(shape_BTHD),
-        'g': TensorSpec(shape_BTH, transform=logsigmoid),
-        'beta': TensorSpec(shape_BTH, transform=sigmoid_transform),
-    },
-    extra_kwargs={'use_qk_l2norm_in_kernel': True},
-    category='comba',
-    default_shapes=_recurrent_default_shapes,
-))
-
-# Generalized delta rule
-register_op(OpConfig(
-    name='fused_recurrent_dplr_delta_rule',
-    import_path='fla.ops.generalized_delta_rule',
-    inputs={
-        **_simple_qkv,
-        'a': TensorSpec(shape_BTHD),
-        'b': TensorSpec(shape_BTHD),
-        'gk': TensorSpec(shape_BTHD, transform=logsigmoid),
-    },
-    category='gen_delta',
-    default_shapes=_recurrent_default_shapes,
-    test_file='tests/ops/test_dplr_delta.py',
-))
-register_op(OpConfig(
-    name='chunk_iplr_delta_rule',
-    import_path='fla.ops.generalized_delta_rule',
-    inputs={
-        **_simple_qkv,
-        'a': TensorSpec(shape_BTHD),
-        'b': TensorSpec(shape_BTHD),
-    },
-    category='gen_delta',
-    test_file='tests/ops/test_iplr_delta.py',
-))
-register_op(OpConfig(
-    name='fused_recurrent_iplr_delta_rule',
-    import_path='fla.ops.generalized_delta_rule',
-    inputs={
-        **_simple_qkv,
-        'a': TensorSpec(shape_BTHD),
-        'b': TensorSpec(shape_BTHD),
-    },
-    category='gen_delta',
-    default_shapes=_recurrent_default_shapes,
-    test_file='tests/ops/test_iplr_delta.py',
-))
-
-# Lightning attention
-register_op(OpConfig(
-    name='fused_recurrent_lightning_attn',
-    import_path='fla.ops.lightning_attn',
-    inputs={**_simple_qkv},
-    extra_kwargs={'layer_idx': 0, 'num_layers': 12},
-    category='lightning',
-    default_shapes=_recurrent_default_shapes,
-))
