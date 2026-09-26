@@ -987,7 +987,7 @@ def chunk_gla_bwd_dqk_intra_npu(
 ):
     B, T, H, K = q.shape
     BT = chunk_size
-    BC = min(32 if K <= 128 else _BC, BT)
+    BC = min(32 if K <= 128 or (K <= 256 and T <= 4096) else _BC, BT)
     BK = _bwd_pick_bk(K)
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
