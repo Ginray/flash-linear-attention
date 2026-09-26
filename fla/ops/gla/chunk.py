@@ -1197,6 +1197,7 @@ def chunk_gla_fwd(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
+    states_in_fp32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if g_cumsum is None:
         g_cumsum = chunk_local_cumsum(
@@ -1216,7 +1217,7 @@ def chunk_gla_fwd(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
-        states_in_fp32=False,
+        states_in_fp32=states_in_fp32,
         state_v_first=state_v_first,
     )
 
@@ -1367,6 +1368,7 @@ class ChunkGLAFunction(torch.autograd.Function):
         state_v_first,
         cu_seqlens,
         cu_seqlens_cpu,
+        grad_enabled,
     ):
         chunk_size = min(64, max(16, triton.next_power_of_2(q.shape[1])))
         if cu_seqlens is not None:
@@ -1378,7 +1380,9 @@ class ChunkGLAFunction(torch.autograd.Function):
         else:
             chunk_indices = None
 
-        g_cumsum, A, _, ht, o = chunk_gla_fwd(
+        # avoid recomputing the fp32 state in the NPU backward pass
+        save_h_for_backward = q.device.type == 'npu' and grad_enabled and any(ctx.needs_input_grad)
+        g_cumsum, A, h, ht, o = chunk_gla_fwd(
             q=q,
             k=k,
             v=v,
@@ -1391,13 +1395,16 @@ class ChunkGLAFunction(torch.autograd.Function):
             chunk_size=chunk_size,
             chunk_indices=chunk_indices,
             state_v_first=state_v_first,
+            states_in_fp32=save_h_for_backward,
         )
         # recompute g_cumsum in bwd pass
         if g.dtype != torch.float:
             g_cumsum = None
         else:
             g = None
-        ctx.save_for_backward(q, k, v, g, g_cumsum, initial_state, A, chunk_indices)
+        ctx.save_for_backward(
+            q, k, v, g, g_cumsum, initial_state, A, chunk_indices, h if save_h_for_backward else None,
+        )
         ctx.chunk_size = chunk_size
         ctx.scale = scale
         ctx.cu_seqlens = cu_seqlens
@@ -1407,7 +1414,7 @@ class ChunkGLAFunction(torch.autograd.Function):
     @staticmethod
     @input_guard
     def backward(ctx, do, dht):
-        q, k, v, g, g_cumsum, initial_state, A, chunk_indices = ctx.saved_tensors
+        q, k, v, g, g_cumsum, initial_state, A, chunk_indices, h = ctx.saved_tensors
         chunk_size, scale, cu_seqlens = ctx.chunk_size, ctx.scale, ctx.cu_seqlens
         dq, dk, dv, dg, dh0 = chunk_gla_bwd(
             q=q,
@@ -1416,7 +1423,7 @@ class ChunkGLAFunction(torch.autograd.Function):
             g=g,
             g_cumsum=g_cumsum,
             scale=scale,
-            h=None,
+            h=h,
             A=A,
             initial_state=initial_state,
             do=do,
@@ -1426,7 +1433,7 @@ class ChunkGLAFunction(torch.autograd.Function):
             chunk_indices=chunk_indices,
             state_v_first=ctx.state_v_first,
         )
-        return dq.to(q), dk.to(k), dv.to(v), dg, None, dh0, None, None, None, None
+        return dq.to(q), dk.to(k), dv.to(v), dg, None, dh0, None, None, None, None, None
 
 
 @torch.compiler.disable
@@ -1532,5 +1539,6 @@ def chunk_gla(
         state_v_first,
         cu_seqlens,
         cu_seqlens_cpu,
+        torch.is_grad_enabled(),
     )
     return o, final_state
