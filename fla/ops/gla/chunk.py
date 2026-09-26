@@ -744,7 +744,7 @@ def chunk_gla_bwd_kernel_dv(
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=['BT', 'STATE_V_FIRST', 'K', 'V'],
+    key=['BT', 'STATE_V_FIRST', 'DH_STATE_V_FIRST', 'K', 'V'],
     prune_configs_by={'early_config_prune': _prune_gla_bwd_configs},
     **autotune_cache_kwargs,
 )
@@ -774,6 +774,7 @@ def chunk_gla_bwd_kernel_inter(
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
+    DH_STATE_V_FIRST: tl.constexpr,
 ):
     i_k, i_t, i_bh = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
@@ -822,11 +823,12 @@ def chunk_gla_bwd_kernel_inter(
         p_v = v + o_t[:, None] * (H*V) + o_v[None, :]
         p_do = do + o_t[:, None] * (H*V) + o_v[None, :]
         if STATE_V_FIRST:
-            # h / dh stored as [V, K] -- the [BV, BK] tile is now a contiguous read
             p_h = h + o_v[:, None] * K + o_k[None, :]
-            p_dh = dh + o_v[:, None] * K + o_k[None, :]
         else:
             p_h = h + o_v[:, None] + o_k[None, :] * V
+        if DH_STATE_V_FIRST:
+            p_dh = dh + o_v[:, None] * K + o_k[None, :]
+        else:
             p_dh = dh + o_v[:, None] + o_k[None, :] * V
         # [BT, BV]
         b_v = tl.load(p_v, mask=m_tv, other=0.0)
@@ -1146,6 +1148,7 @@ def chunk_gla_bwd_dqkg(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
+    dh_state_v_first: bool | None = None,
 ):
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = chunk_size
@@ -1180,6 +1183,7 @@ def chunk_gla_bwd_dqkg(
         V=V,
         BT=BT,
         STATE_V_FIRST=state_v_first,
+        DH_STATE_V_FIRST=state_v_first if dh_state_v_first is None else dh_state_v_first,
     )
     return dq2, dk2, dg
 
@@ -1272,6 +1276,16 @@ def chunk_gla_bwd(
             cu_seqlens=cu_seqlens,
         )
 
+    dh_state_v_first = state_v_first or (
+        q.device.type == 'npu'
+        and initial_state is None
+        and dht is None
+        and cu_seqlens is None
+        and chunk_size == 64
+        and q.shape[-1] == v.shape[-1] == 256
+        and q.shape[1] <= 4096
+    )
+
     if h is None:
         h, _ = chunk_fwd_h(
             k=k,
@@ -1300,7 +1314,7 @@ def chunk_gla_bwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         states_in_fp32=True,
-        state_v_first=state_v_first,
+        state_v_first=dh_state_v_first,
     )
 
     dv = chunk_gla_bwd_dv(
@@ -1312,7 +1326,7 @@ def chunk_gla_bwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
-        state_v_first=state_v_first,
+        state_v_first=dh_state_v_first,
     )
 
     # dq dk in fp32
@@ -1348,6 +1362,7 @@ def chunk_gla_bwd(
         chunk_size=chunk_size,
         chunk_indices=chunk_indices,
         state_v_first=state_v_first,
+        dh_state_v_first=dh_state_v_first,
     )
     return dq, dk, dv, dg, dh0
 

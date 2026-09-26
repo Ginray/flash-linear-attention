@@ -1032,7 +1032,7 @@ def chunk_gla_bwd_kernel_inter_npu(
     cu_seqlens, chunk_indices, scale, T,
     H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
-    IS_VARLEN: tl.constexpr, STATE_V_FIRST: tl.constexpr,
+    IS_VARLEN: tl.constexpr, STATE_V_FIRST: tl.constexpr, DH_STATE_V_FIRST: tl.constexpr,
     A_OFFSET, NT_OFFSET, BH_OFFSET,
 ):
     i_k = tl.program_id(0) + A_OFFSET
@@ -1088,9 +1088,11 @@ def chunk_gla_bwd_kernel_inter_npu(
         b_do = tl.load(do_base + o_t[:, None] * (H * V) + o_v[None, :], mask=m_tv, other=0.0).to(tl.float32)
         if STATE_V_FIRST:
             b_h = tl.load(h_base + o_v[:, None] * K + o_k[None, :], mask=m_vk, other=0.0).to(tl.float32)
-            b_dh = tl.load(dh_base + o_v[:, None] * K + o_k[None, :], mask=m_vk, other=0.0).to(tl.float32)
         else:
             b_h = tl.load(h_base + o_v[:, None] + o_k[None, :] * V, mask=m_vk, other=0.0).to(tl.float32)
+        if DH_STATE_V_FIRST:
+            b_dh = tl.load(dh_base + o_v[:, None] * K + o_k[None, :], mask=m_vk, other=0.0).to(tl.float32)
+        else:
             b_dh = tl.load(dh_base + o_v[:, None] + o_k[None, :] * V, mask=m_vk, other=0.0).to(tl.float32)
         b_dgk += tl.sum(b_h * b_dh, axis=0)
         b_dq = tl.dot(b_do, b_h, b_dq, allow_tf32=False)
@@ -1128,6 +1130,7 @@ def chunk_gla_bwd_dqkg_npu(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
+    dh_state_v_first: bool | None = None,
 ):
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = chunk_size
@@ -1149,6 +1152,7 @@ def chunk_gla_bwd_dqkg_npu(
             dq2=dq2, dk2=dk2, dg=dg,
             cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, scale=scale, T=T,
             H=H, K=K, V=V, BT=BT, BK=BK, BV=BV, STATE_V_FIRST=state_v_first,
+            DH_STATE_V_FIRST=state_v_first if dh_state_v_first is None else dh_state_v_first,
             A_OFFSET=0, NT_OFFSET=0, BH_OFFSET=0,
         ),
         compile_kwargs=_GLA_COMPILE_KWARGS,
