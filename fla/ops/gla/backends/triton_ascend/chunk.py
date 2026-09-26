@@ -989,6 +989,11 @@ def chunk_gla_bwd_dqk_intra_npu(
     BT = chunk_size
     BC = min(32 if K <= 128 or (K <= 256 and T <= 4096) else _BC, BT)
     BK = _bwd_pick_bk(K)
+    if K == 128 and T <= 4096:
+        BK = compute_row_tile_block_size(
+            BC, K, 8.0, tiling_row=False, safety_margin=_SAFETY_MARGIN,
+            fallback=_FALLBACK, min_block=16, max_block=128,
+        )
     if K == 256 and BC == 32 and T <= 4096:
         BK = compute_row_tile_block_size(
             BC, K, 8.0, tiling_row=False, safety_margin=_SAFETY_MARGIN,
