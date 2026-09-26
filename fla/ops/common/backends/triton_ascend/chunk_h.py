@@ -329,9 +329,9 @@ def chunk_fwd_h_npu(
     N, NS = B, triton.cdiv(T, BS)
     NT = triton.cdiv(T, BT)
     state_shape = (V, K) if state_v_first else (K, V)
-    # zero-init: kernels may only partially store each tile
-    h = k.new_zeros(B, NS, H, *state_shape, dtype=torch.float if states_in_fp32 else k.dtype)
-    ht = k.new_zeros(N, H, *state_shape, dtype=torch.float) if output_final_state else None
+    new_state = k.new_empty if gk is not None and g is None and gv is None else k.new_zeros
+    h = new_state(B, NS, H, *state_shape, dtype=torch.float if states_in_fp32 else k.dtype)
+    ht = new_state(N, H, *state_shape, dtype=torch.float) if output_final_state else None
 
     BK, BV = _chunk_gated_h_tile_size(
         K, V, use_gk=gk is not None, state_v_first=state_v_first,
@@ -426,7 +426,8 @@ def chunk_bwd_dh_npu(
     NT = triton.cdiv(T, BT)
 
     state_shape = (V, K) if state_v_first else (K, V)
-    dh = k.new_zeros(B, NS, HQ, *state_shape, dtype=torch.float if states_in_fp32 else k.dtype)
+    new_state = k.new_empty if gk is not None and g is None and gv is None else k.new_zeros
+    dh = new_state(B, NS, HQ, *state_shape, dtype=torch.float if states_in_fp32 else k.dtype)
     dh0 = torch.zeros_like(h0, dtype=torch.float) if h0 is not None else None
 
     BK, BV = _chunk_gated_h_tile_size(
