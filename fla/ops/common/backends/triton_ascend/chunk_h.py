@@ -195,7 +195,10 @@ def chunk_bwd_kernel_dh_npu(
             p_dht = dht + dht_base + o_k[:, None].to(tl.int64) * V + o_v[None, :]
             b_dh += tl.load(p_dht, mask=(o_k[:, None] < K) & (o_v[None, :] < V), other=0.0).to(tl.float32)
 
-    for step in tl.static_range(NT):
+    for step in tl.range(
+        0, NT,
+        loop_unroll_factor=8 if (USE_GK and K == 256) and (NT >= 8 and NT <= 64) else NT,
+    ):
         i_t = NT - 1 - step
         i_s = i_t // (BS // BT)
         o_dh = ((boh + i_s) * H + i_h) * K * V
