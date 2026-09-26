@@ -40,6 +40,19 @@ def _chunk_h_tile_size(K: int, V: int) -> tuple[int, int]:
     return _BK, _BV
 
 
+def _chunk_fwd_h_tile_size(
+    K: int,
+    V: int,
+    *,
+    use_gk: bool,
+    state_v_first: bool,
+) -> tuple[int, int]:
+    """Widen only K for large per-key-gated forward state updates."""
+    if use_gk and not state_v_first and K > 128 and V > 128:
+        return 64, 32
+    return _chunk_h_tile_size(K, V)
+
+
 @triton.heuristics({
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
     'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
@@ -316,7 +329,9 @@ def chunk_fwd_h_npu(
     h = k.new_zeros(B, NS, H, *state_shape, dtype=torch.float if states_in_fp32 else k.dtype)
     ht = k.new_zeros(N, H, *state_shape, dtype=torch.float) if output_final_state else None
 
-    BK, BV = _chunk_h_tile_size(K, V)
+    BK, BV = _chunk_fwd_h_tile_size(
+        K, V, use_gk=gk is not None, state_v_first=state_v_first,
+    )
     launch_grid_chunked(
         chunk_fwd_kernel_h_npu,
         (triton.cdiv(K, BK), triton.cdiv(V, BV), N * H),
