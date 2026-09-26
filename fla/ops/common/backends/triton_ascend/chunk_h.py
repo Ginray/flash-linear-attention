@@ -197,7 +197,10 @@ def chunk_bwd_kernel_dh_npu(
 
     for step in tl.range(
         0, NT,
-        loop_unroll_factor=8 if (USE_GK and K == 256) and (NT >= 8 and NT <= 64) else NT,
+        loop_unroll_factor=8 if (
+            ((USE_GK and K == 128) and (NT >= 8 and NT <= 256))
+            or ((USE_GK and K == 256) and (NT >= 8 and NT <= 64))
+        ) else NT,
     ):
         i_t = NT - 1 - step
         i_s = i_t // (BS // BT)
