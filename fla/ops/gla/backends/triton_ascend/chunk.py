@@ -548,6 +548,8 @@ def chunk_gla_fwd_o_gk_npu(
 
     o = torch.empty_like(v)
     BV = min(_FWD_O_BV, triton.next_power_of_2(V))
+    if K == 256 and V == 256 and T <= 4096:
+        BV = 256
     NV = triton.cdiv(V, BV)
     num_core = get_npu_properties()['num_aicore']
     task_num = NV * HV * total_chunks
