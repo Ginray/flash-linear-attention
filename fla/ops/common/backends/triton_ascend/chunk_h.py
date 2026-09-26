@@ -7,10 +7,11 @@
 
 """chunk_fwd_h / chunk_bwd_dh for triton-ascend on Ascend NPU (GLA-style state).
 
-Ascend requires host-specialized ``NT`` + ``tl.static_range(NT)``. Dynamic
-``for i_t in range(tl.cdiv(T, BT))`` under-iterates when ``T`` is unspecialized.
-The kernels below only handle equal-length inputs; varlen inputs are split per
-sequence on the host (see ``chunk_fwd_h_npu``/``chunk_bwd_dh_npu``).
+Ascend requires host-specialized ``NT`` because ``T`` is unspecialized in the
+kernels below; deriving the loop bound directly from ``T`` can under-iterate.
+The forward per-key-gated path rolls the constexpr-bounded loop; other forward
+gate modes stay fully unrolled. Varlen inputs are split per sequence on the
+host (see ``chunk_fwd_h_npu``/``chunk_bwd_dh_npu``).
 """
 
 from __future__ import annotations
@@ -91,7 +92,7 @@ def chunk_fwd_kernel_h_npu(
             p_h0 = h0 + h0_base + o_k[:, None].to(tl.int64) * V + o_v[None, :]
             b_h = tl.load(p_h0, mask=(o_k[:, None] < K) & (o_v[None, :] < V), other=0.0).to(tl.float32)
 
-    for i_t in tl.static_range(NT):
+    for i_t in tl.range(0, NT, loop_unroll_factor=1 if USE_GK else NT):
         i_s = i_t // NTS
         o_t = (i_t * BT + tl.arange(0, BT)).to(tl.int64)
         m_t = o_t < T
