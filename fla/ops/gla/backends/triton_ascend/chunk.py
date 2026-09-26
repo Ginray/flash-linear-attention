@@ -1128,6 +1128,8 @@ def chunk_gla_bwd_dqkg_npu(
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK, BV = _bwd_pick_bk(K), _bwd_pick_bv(V)
+    if not state_v_first and K == 256 and V == 256 and T <= 4096:
+        BV = 128
     dg = torch.empty_like(g)
     dq2 = torch.empty_like(dq)
     dk2 = torch.empty_like(dk)
