@@ -1009,8 +1009,9 @@ def chunk_gla_bwd_dqk_intra_npu(
             q=q, k=k, g=g, dA=dA, dq=dq, dk=dk,
             cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, T=T,
             H=H, K=K, BT=BT, BC=BC, BK=BK, NC=NC,
-            # Keep long sequences and non-16/32 row tiles on the baseline loop.
-            USE_DIAG_DOT=(BC in (16, 32) and T <= 4096),
+            # Keep non-16/32 row tiles on the baseline loop; long K128 sequences
+            # use the rebased dot path to reduce the scalar diagonal loop.
+            USE_DIAG_DOT=(BC in (16, 32) and (T <= 4096 or (K == 128 and T > 4096))),
             A_OFFSET=0, NT_OFFSET=0, BH_OFFSET=0,
         ),
     )
