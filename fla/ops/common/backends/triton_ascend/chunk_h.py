@@ -437,7 +437,7 @@ def chunk_bwd_dh_npu(
         K, V, use_gk=gk is not None, state_v_first=state_v_first,
     )
     if gk is not None and g is None and gv is None and not state_v_first and K == 256 and V == 256 and T <= 4096:
-        BK = 128
+        BK = 256
     launch_grid_chunked(
         chunk_bwd_kernel_dh_npu,
         (triton.cdiv(K, BK), triton.cdiv(V, BV), N * HQ),
