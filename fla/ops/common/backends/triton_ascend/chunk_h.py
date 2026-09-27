@@ -453,6 +453,25 @@ def chunk_bwd_dh_npu(
     if (
         gk is not None
         and g is None
+        and g_gamma is None
+        and gv is None
+        and not state_v_first
+        and h0 is None
+        and dht is None
+        and cu_seqlens is None
+        and chunk_size == 64
+        and HQ == H
+        and K == V == 128
+        and (
+            (B == 1 and T == 8192 and H == 96)
+            or (B == 2 and T == 16384 and H == 16)
+        )
+    ):
+        # The measured long D128 GLA shapes benefit from one full V tile.
+        BV = 128
+    if (
+        gk is not None
+        and g is None
         and gv is None
         and K == 256
         and V == 256
