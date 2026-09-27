@@ -1397,6 +1397,14 @@ class ChunkGLAFunction(torch.autograd.Function):
 
         # avoid recomputing the fp32 state in the NPU backward pass
         save_h_for_backward = q.device.type == 'npu' and grad_enabled and any(ctx.needs_input_grad)
+        save_g_cumsum_for_backward = (
+            save_h_for_backward
+            and g.dtype == torch.bfloat16
+            and cu_seqlens is None
+            and chunk_size == 64
+            and q.shape[1] > 4096
+            and q.shape[-1] == v.shape[-1] == 128
+        )
         g_cumsum, A, h, ht, o = chunk_gla_fwd(
             q=q,
             k=k,
@@ -1412,8 +1420,7 @@ class ChunkGLAFunction(torch.autograd.Function):
             state_v_first=state_v_first,
             states_in_fp32=save_h_for_backward,
         )
-        # recompute g_cumsum in bwd pass
-        if g.dtype != torch.float:
+        if g.dtype != torch.float and not save_g_cumsum_for_backward:
             g_cumsum = None
         else:
             g = None
