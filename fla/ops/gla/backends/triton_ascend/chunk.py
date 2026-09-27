@@ -657,6 +657,9 @@ def chunk_gla_bwd_dA_npu(
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BV = _bwd_pick_bv(V)
+    if V == 128:
+        # The [BT, BT] accumulator fits one full V reduction tile.
+        BV = 128
     dA = v.new_zeros(B, T, H, BT, dtype=torch.float)
     launch_grid_chunked(
         chunk_gla_bwd_kernel_dA_npu,
