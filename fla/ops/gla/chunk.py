@@ -1406,8 +1406,10 @@ class ChunkGLAFunction(torch.autograd.Function):
             and g.dtype == torch.bfloat16
             and cu_seqlens is None
             and chunk_size == 64
-            and q.shape[1] > 4096
-            and q.shape[-1] == v.shape[-1] == 128
+            and (
+                (q.shape[-1] == v.shape[-1] == 128 and q.shape[1] > 4096)
+                or (q.shape[-1] == v.shape[-1] == 256 and q.shape[1] >= 2048)
+            )
         )
         g_cumsum, A, h, ht, o = chunk_gla_fwd(
             q=q,
