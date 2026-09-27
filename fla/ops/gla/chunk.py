@@ -1407,7 +1407,7 @@ class ChunkGLAFunction(torch.autograd.Function):
             and cu_seqlens is None
             and chunk_size == 64
             and (
-                (q.shape[-1] == v.shape[-1] == 128 and q.shape[1] > 4096)
+                (q.shape[-1] == v.shape[-1] == 128 and q.shape[1] >= 4096)
                 or (q.shape[-1] == v.shape[-1] == 256 and q.shape[1] >= 2048)
             )
         )
