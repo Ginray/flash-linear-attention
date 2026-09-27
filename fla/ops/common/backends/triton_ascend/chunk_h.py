@@ -442,6 +442,16 @@ def chunk_bwd_dh_npu(
         gk is not None
         and g is None
         and gv is None
+        and not state_v_first
+        and K == V == 128
+        and BT == 64
+        and T <= 4096
+    ):
+        BK = 128
+    if (
+        gk is not None
+        and g is None
+        and gv is None
         and K == 256
         and V == 256
         and T <= 4096
