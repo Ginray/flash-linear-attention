@@ -822,7 +822,7 @@ def chunk_gla_bwd_dv_npu(
 def chunk_gla_bwd_kernel_intra_npu(
     q, k, g, dA, dq, dk, cu_seqlens, chunk_indices, T,
     H: tl.constexpr, K: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, BK: tl.constexpr, NC: tl.constexpr,
-    USE_DIAG_DOT: tl.constexpr, ROLL_DQ_DIAG: tl.constexpr,
+    USE_DIAG_DOT: tl.constexpr, ROLL_DQ_DIAG: tl.constexpr, FULL_TILE: tl.constexpr,
     IS_VARLEN: tl.constexpr, A_OFFSET, NT_OFFSET, BH_OFFSET,
 ):
     i_kc = tl.program_id(0) + A_OFFSET
@@ -837,20 +837,26 @@ def chunk_gla_bwd_kernel_intra_npu(
         bos = tl.cast(i_b, tl.int64) * T
         eos = bos + T
     T = eos - bos
-    if i_t * BT + i_i * BC >= T:
+    if not FULL_TILE and i_t * BT + i_i * BC >= T:
         return
 
     o_k = i_k * BK + tl.arange(0, BK)
     m_k = o_k < K
     o_c = i_t * BT + i_i * BC + tl.arange(0, BC)
-    m_c = o_c < T
+    if FULL_TILE:
+        m_c = tl.full((BC,), True, tl.int1)
+    else:
+        m_c = o_c < T
     m_ck = m_c[:, None] & m_k[None, :]
     b_g = tl.load(
         g + (bos * H + i_h) * K + o_c[:, None] * (H * K) + o_k[None, :],
         mask=m_ck, other=0.0,
     ).to(tl.float32)
     o_i = tl.arange(0, BC)
-    max_j = min(BC, T - i_t * BT - i_i * BC)
+    if FULL_TILE:
+        max_j = BC
+    else:
+        max_j = min(BC, T - i_t * BT - i_i * BC)
 
     b_dq = tl.zeros([BC, BK], dtype=tl.float32)
     if i_i > 0:
@@ -957,14 +963,24 @@ def chunk_gla_bwd_kernel_intra_npu(
 
     tl.debug_barrier()
     b_dk = tl.zeros([BC, BK], dtype=tl.float32)
-    NC_eff = min(NC, tl.cdiv(T - i_t * BT, BC))
+    if FULL_TILE:
+        NC_eff = NC
+    else:
+        NC_eff = min(NC, tl.cdiv(T - i_t * BT, BC))
     if i_i < NC_eff - 1:
-        p_gn2 = g + (bos + min(i_t * BT + i_i * BC + BC, T) - 1) * H * K + i_h * K + o_k
+        if FULL_TILE:
+            last_i = i_t * BT + i_i * BC + BC - 1
+        else:
+            last_i = min(i_t * BT + i_i * BC + BC, T) - 1
+        p_gn2 = g + (bos + last_i) * H * K + i_h * K + o_k
         b_gn2 = tl.load(p_gn2, mask=m_k, other=0).to(tl.float32)
         for i_j in range(i_i + 1, NC_eff):
             o_j = i_t * BT + i_j * BC + o_i
             o_iA = i_i * BC + tl.arange(0, BC)
-            m_j = o_j < T
+            if FULL_TILE:
+                m_j = tl.full((BC,), True, tl.int1)
+            else:
+                m_j = o_j < T
             m_jk = m_j[:, None] & m_k[None, :]
             m_da = (o_iA[:, None] < BT) & m_j[None, :]
             b_q = tl.load(
@@ -1061,6 +1077,10 @@ def chunk_gla_bwd_dqk_intra_npu(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     NC = triton.cdiv(BT, BC)
     NK = triton.cdiv(K, BK)
+    full_tile = (
+        cu_seqlens is None and chunk_size == 64
+        and (B, T, H, K, BC, BK) == (8, 2048, 32, 256, 32, 128)
+    )
     dq = torch.zeros_like(q, dtype=torch.float)
     dk = torch.zeros_like(k, dtype=torch.float)
     launch_grid_chunked(
@@ -1076,6 +1096,7 @@ def chunk_gla_bwd_dqk_intra_npu(
             USE_DIAG_DOT=(BC in (16, 32) and (T <= 4096 or (K == 128 and T > 4096))),
             # Roll only the profiled fixed-length D256 long-sequence path.
             ROLL_DQ_DIAG=(cu_seqlens is None and K == 256 and 2048 <= T <= 4096),
+            FULL_TILE=full_tile,
             A_OFFSET=0, NT_OFFSET=0, BH_OFFSET=0,
         ),
     )
