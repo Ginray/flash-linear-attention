@@ -1141,8 +1141,8 @@ def chunk_gla_bwd_dqkg_npu(
     if not state_v_first and K == 256 and V == 256 and T <= 4096:
         BV = 128
     dg = torch.empty_like(g)
-    dq2 = torch.empty_like(dq)
-    dk2 = torch.empty_like(dk)
+    # Each inter program owns a disjoint token/head/key tile, so it can add in place.
+    dq2, dk2 = dq, dk
     launch_grid_chunked(
         chunk_gla_bwd_kernel_inter_npu,
         (triton.cdiv(K, BK), NT, B * H),
