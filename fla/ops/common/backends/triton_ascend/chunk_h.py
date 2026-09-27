@@ -341,6 +341,8 @@ def chunk_fwd_h_npu(
     )
     if gk is not None and not state_v_first and K == 128 and V == 128:
         BV = 128
+        if T > 4096:
+            BK = 128
     if gk is not None and not state_v_first and K == 256 and V == 256 and T <= 4096:
         BK = 64
         BV = 128
