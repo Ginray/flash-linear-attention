@@ -465,6 +465,7 @@ def chunk_bwd_dh_npu(
         and (
             (B == 1 and T == 8192 and H == 96)
             or (B == 2 and T == 16384 and H == 16)
+            or (B == 4 and T == 4096 and H == 64)
         )
     ):
         # The measured long D128 GLA shapes benefit from one full V tile.
