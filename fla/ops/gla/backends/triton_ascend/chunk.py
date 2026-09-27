@@ -801,7 +801,7 @@ def chunk_gla_bwd_dv_npu(
 def chunk_gla_bwd_kernel_intra_npu(
     q, k, g, dA, dq, dk, cu_seqlens, chunk_indices, T,
     H: tl.constexpr, K: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, BK: tl.constexpr, NC: tl.constexpr,
-    USE_DIAG_DOT: tl.constexpr,
+    USE_DIAG_DOT: tl.constexpr, ROLL_DQ_DIAG: tl.constexpr,
     IS_VARLEN: tl.constexpr, A_OFFSET, NT_OFFSET, BH_OFFSET,
 ):
     i_kc = tl.program_id(0) + A_OFFSET
@@ -858,34 +858,64 @@ def chunk_gla_bwd_kernel_intra_npu(
 
     # Rebase gates per 16 source rows to keep the factored exp2 range local.
     if USE_DIAG_DOT:
-        for j_start in tl.static_range(0, BC, 16):
-            if j_start < max_j:
-                source_len = min(16, max_j - j_start)
-                i_gm = i_t * BT + i_i * BC + j_start + min(8, source_len - 1)
-                b_gm = tl.load(
-                    g + (bos * H + i_h) * K + i_gm * (H * K) + o_k,
-                    mask=m_k, other=0.0,
-                ).to(tl.float32)
-                o_j = j_start + tl.arange(0, 16)
-                o_jA = i_i * BC + o_j
-                o_jg = i_t * BT + o_jA
-                m_j = o_j < max_j
-                m_jk = m_j[:, None] & m_k[None, :]
-                m_dA_diag = m_c[:, None] & (o_jA[None, :] < BT) & (o_i[:, None] >= o_j[None, :])
-                b_dA_diag = tl.load(
-                    dA + (bos * H + i_h) * BT + o_c[:, None] * (H * BT) + o_jA[None, :],
-                    mask=m_dA_diag, other=0.0,
-                ).to(tl.float32)
-                b_k_diag = tl.load(
-                    k + (bos * H + i_h) * K + o_jg[:, None] * (H * K) + o_k[None, :],
-                    mask=m_jk, other=0.0,
-                ).to(tl.float32)
-                b_g_diag = tl.extract_slice(b_g, [j_start, 0], [16, BK], [1, 1])
-                b_k_exp = tl.where(m_jk, b_k_diag * exp2(b_gm[None, :] - b_g_diag), 0.0)
-                b_dA_diag_dq = b_dA_diag + 0.0  # Ascend tl.dot may clobber its left operand.
-                b_dq += tl.dot(b_dA_diag_dq, b_k_exp, allow_tf32=False) * tl.where(
-                    m_c[:, None] & (o_i[:, None] >= j_start), exp2(b_g - b_gm[None, :]), 0.0,
-                )
+        if ROLL_DQ_DIAG:
+            for j_start in tl.range(0, BC, 16, loop_unroll_factor=1):
+                if j_start < max_j:
+                    source_len = min(16, max_j - j_start)
+                    i_gm = i_t * BT + i_i * BC + j_start + min(8, source_len - 1)
+                    b_gm = tl.load(
+                        g + (bos * H + i_h) * K + i_gm * (H * K) + o_k,
+                        mask=m_k, other=0.0,
+                    ).to(tl.float32)
+                    o_j = j_start + tl.arange(0, 16)
+                    o_jA = i_i * BC + o_j
+                    o_jg = i_t * BT + o_jA
+                    m_j = o_j < max_j
+                    m_jk = m_j[:, None] & m_k[None, :]
+                    m_dA_diag = m_c[:, None] & (o_jA[None, :] < BT) & (o_i[:, None] >= o_j[None, :])
+                    b_dA_diag = tl.load(
+                        dA + (bos * H + i_h) * BT + o_c[:, None] * (H * BT) + o_jA[None, :],
+                        mask=m_dA_diag, other=0.0,
+                    ).to(tl.float32)
+                    b_k_diag = tl.load(
+                        k + (bos * H + i_h) * K + o_jg[:, None] * (H * K) + o_k[None, :],
+                        mask=m_jk, other=0.0,
+                    ).to(tl.float32)
+                    b_g_diag = tl.extract_slice(b_g, [j_start, 0], [16, BK], [1, 1])
+                    b_k_exp = tl.where(m_jk, b_k_diag * exp2(b_gm[None, :] - b_g_diag), 0.0)
+                    b_dA_diag_dq = b_dA_diag + 0.0  # Ascend tl.dot may clobber its left operand.
+                    b_dq += tl.dot(b_dA_diag_dq, b_k_exp, allow_tf32=False) * tl.where(
+                        m_c[:, None] & (o_i[:, None] >= j_start), exp2(b_g - b_gm[None, :]), 0.0,
+                    )
+        else:
+            for j_start in tl.static_range(0, BC, 16):
+                if j_start < max_j:
+                    source_len = min(16, max_j - j_start)
+                    i_gm = i_t * BT + i_i * BC + j_start + min(8, source_len - 1)
+                    b_gm = tl.load(
+                        g + (bos * H + i_h) * K + i_gm * (H * K) + o_k,
+                        mask=m_k, other=0.0,
+                    ).to(tl.float32)
+                    o_j = j_start + tl.arange(0, 16)
+                    o_jA = i_i * BC + o_j
+                    o_jg = i_t * BT + o_jA
+                    m_j = o_j < max_j
+                    m_jk = m_j[:, None] & m_k[None, :]
+                    m_dA_diag = m_c[:, None] & (o_jA[None, :] < BT) & (o_i[:, None] >= o_j[None, :])
+                    b_dA_diag = tl.load(
+                        dA + (bos * H + i_h) * BT + o_c[:, None] * (H * BT) + o_jA[None, :],
+                        mask=m_dA_diag, other=0.0,
+                    ).to(tl.float32)
+                    b_k_diag = tl.load(
+                        k + (bos * H + i_h) * K + o_jg[:, None] * (H * K) + o_k[None, :],
+                        mask=m_jk, other=0.0,
+                    ).to(tl.float32)
+                    b_g_diag = tl.extract_slice(b_g, [j_start, 0], [16, BK], [1, 1])
+                    b_k_exp = tl.where(m_jk, b_k_diag * exp2(b_gm[None, :] - b_g_diag), 0.0)
+                    b_dA_diag_dq = b_dA_diag + 0.0  # Ascend tl.dot may clobber its left operand.
+                    b_dq += tl.dot(b_dA_diag_dq, b_k_exp, allow_tf32=False) * tl.where(
+                        m_c[:, None] & (o_i[:, None] >= j_start), exp2(b_g - b_gm[None, :]), 0.0,
+                    )
     else:
         for j in tl.static_range(BC):
             active = j < max_j
@@ -1023,6 +1053,8 @@ def chunk_gla_bwd_dqk_intra_npu(
             # Keep non-16/32 row tiles on the baseline loop; long K128 sequences
             # use the rebased dot path to reduce the scalar diagonal loop.
             USE_DIAG_DOT=(BC in (16, 32) and (T <= 4096 or (K == 128 and T > 4096))),
+            # Roll only the profiled fixed-length D256 long-sequence path.
+            ROLL_DQ_DIAG=(cu_seqlens is None and K == 256 and 2048 <= T <= 4096),
             A_OFFSET=0, NT_OFFSET=0, BH_OFFSET=0,
         ),
     )
