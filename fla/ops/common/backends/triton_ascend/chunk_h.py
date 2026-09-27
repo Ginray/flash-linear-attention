@@ -460,6 +460,21 @@ def chunk_bwd_dh_npu(
         and (not state_v_first or (h0 is None and dht is None and cu_seqlens is None))
     ):
         BK = 256
+    if (
+        gk is not None
+        and g is None
+        and gv is None
+        and state_v_first
+        and h0 is None
+        and dht is None
+        and cu_seqlens is None
+        and chunk_size == 64
+        and K == V == 256
+        and B * H >= 128
+        and 2048 <= T <= 4096
+    ):
+        # The profiled D256 V-first GLA path has enough parallel heads for BV64.
+        BV = 64
     launch_grid_chunked(
         chunk_bwd_kernel_dh_npu,
         (triton.cdiv(K, BK), triton.cdiv(V, BV), N * HQ),
