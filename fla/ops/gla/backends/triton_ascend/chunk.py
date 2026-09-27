@@ -600,6 +600,7 @@ def _bwd_pick_bv(V: int) -> int:
 def chunk_gla_bwd_kernel_dA_npu(
     v, do, dA, cu_seqlens, chunk_indices, scale, T,
     H: tl.constexpr, V: tl.constexpr, BT: tl.constexpr, BV: tl.constexpr,
+    NATIVE_DOT: tl.constexpr,
     IS_VARLEN: tl.constexpr, NT_OFFSET, BH_OFFSET,
 ):
     i_t = tl.program_id(0).to(tl.int64) + NT_OFFSET
@@ -626,14 +627,24 @@ def chunk_gla_bwd_kernel_dA_npu(
         m_v = o_v < V
         m_tv = m_t[:, None] & m_v[None, :]
         m_vt = m_v[:, None] & m_t[None, :]
-        b_do = tl.load(
-            do + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :],
-            mask=m_tv, other=0.0,
-        ).to(tl.float32)
-        b_v = tl.load(
-            v + (bos * H + i_h) * V + o_v[:, None] + o_t[None, :] * (H * V),
-            mask=m_vt, other=0.0,
-        ).to(tl.float32)
+        if NATIVE_DOT:
+            b_do = tl.load(
+                do + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :],
+                mask=m_tv, other=0.0,
+            )
+            b_v = tl.load(
+                v + (bos * H + i_h) * V + o_v[:, None] + o_t[None, :] * (H * V),
+                mask=m_vt, other=0.0,
+            )
+        else:
+            b_do = tl.load(
+                do + (bos * H + i_h) * V + o_t[:, None] * (H * V) + o_v[None, :],
+                mask=m_tv, other=0.0,
+            ).to(tl.float32)
+            b_v = tl.load(
+                v + (bos * H + i_h) * V + o_v[:, None] + o_t[None, :] * (H * V),
+                mask=m_vt, other=0.0,
+            ).to(tl.float32)
         b_dA = tl.dot(b_do, b_v, b_dA, allow_tf32=False)
 
     m_s = tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :]
@@ -662,6 +673,10 @@ def chunk_gla_bwd_dA_npu(
         BV = 128
     if cu_seqlens is None and V == 256:
         BV = 128
+    native_dot = (
+        cu_seqlens is None and v.dtype == torch.bfloat16 and chunk_size == 64
+        and (B, T, H, V) == (4, 4096, 64, 128)
+    )
     dA = v.new_zeros(B, T, H, BT, dtype=torch.float)
     launch_grid_chunked(
         chunk_gla_bwd_kernel_dA_npu,
@@ -670,6 +685,7 @@ def chunk_gla_bwd_dA_npu(
         kernel_kwargs=dict(
             v=v, do=do, dA=dA, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices,
             scale=scale, T=T, H=H, V=V, BT=BT, BV=BV,
+            NATIVE_DOT=native_dot,
             NT_OFFSET=0, BH_OFFSET=0,
         ),
     )
