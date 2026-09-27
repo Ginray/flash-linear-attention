@@ -823,11 +823,17 @@ def chunk_gla_bwd_kernel_intra_npu(
     q, k, g, dA, dq, dk, cu_seqlens, chunk_indices, T,
     H: tl.constexpr, K: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr, BK: tl.constexpr, NC: tl.constexpr,
     USE_DIAG_DOT: tl.constexpr, ROLL_DQ_DIAG: tl.constexpr, FULL_TILE: tl.constexpr,
+    GRID_BH_FIRST: tl.constexpr,
     IS_VARLEN: tl.constexpr, A_OFFSET, NT_OFFSET, BH_OFFSET,
 ):
-    i_kc = tl.program_id(0) + A_OFFSET
-    i_t = tl.program_id(1).to(tl.int64) + NT_OFFSET
-    i_bh = tl.program_id(2).to(tl.int64) + BH_OFFSET
+    if GRID_BH_FIRST:
+        i_bh = tl.program_id(0).to(tl.int64) + BH_OFFSET
+        i_t = tl.program_id(1).to(tl.int64) + NT_OFFSET
+        i_kc = tl.program_id(2) + A_OFFSET
+    else:
+        i_kc = tl.program_id(0) + A_OFFSET
+        i_t = tl.program_id(1).to(tl.int64) + NT_OFFSET
+        i_bh = tl.program_id(2).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // H, i_bh % H
     i_k, i_i = i_kc // NC, i_kc % NC
     if IS_VARLEN:
@@ -1081,12 +1087,19 @@ def chunk_gla_bwd_dqk_intra_npu(
         cu_seqlens is None and chunk_size == 64
         and (B, T, H, K, BC, BK) == (8, 2048, 32, 256, 32, 128)
     )
+    grid_bh_first = full_tile
     dq = torch.zeros_like(q, dtype=torch.float)
     dk = torch.zeros_like(k, dtype=torch.float)
+    if grid_bh_first:
+        grid = (B * H, NT, NK * NC)
+        offset_keys = ('BH_OFFSET', 'NT_OFFSET', 'A_OFFSET')
+    else:
+        grid = (NK * NC, NT, B * H)
+        offset_keys = ('A_OFFSET', 'NT_OFFSET', 'BH_OFFSET')
     launch_grid_chunked(
         chunk_gla_bwd_kernel_intra_npu,
-        (NK * NC, NT, B * H),
-        offset_keys=('A_OFFSET', 'NT_OFFSET', 'BH_OFFSET'),
+        grid,
+        offset_keys=offset_keys,
         kernel_kwargs=dict(
             q=q, k=k, g=g, dA=dA, dq=dq, dk=dk,
             cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, T=T,
@@ -1097,6 +1110,7 @@ def chunk_gla_bwd_dqk_intra_npu(
             # Roll only the profiled fixed-length D256 long-sequence path.
             ROLL_DQ_DIAG=(cu_seqlens is None and K == 256 and 2048 <= T <= 4096),
             FULL_TILE=full_tile,
+            GRID_BH_FIRST=grid_bh_first,
             A_OFFSET=0, NT_OFFSET=0, BH_OFFSET=0,
         ),
     )
