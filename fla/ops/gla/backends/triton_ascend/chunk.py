@@ -870,10 +870,7 @@ def chunk_gla_bwd_kernel_intra_npu(
                     k + (bos * H + i_h) * K + o_jg[:, None] * (H * K) + o_k[None, :],
                     mask=m_jk, other=0.0,
                 ).to(tl.float32)
-                b_g_diag = tl.load(
-                    g + (bos * H + i_h) * K + o_jg[:, None] * (H * K) + o_k[None, :],
-                    mask=m_jk, other=0.0,
-                ).to(tl.float32)
+                b_g_diag = tl.extract_slice(b_g, [j_start, 0], [16, BK], [1, 1])
                 b_k_exp = tl.where(m_jk, b_k_diag * exp2(b_gm[None, :] - b_g_diag), 0.0)
                 b_dA_diag_dq = b_dA_diag + 0.0  # Ascend tl.dot may clobber its left operand.
                 b_dq += tl.dot(b_dA_diag_dq, b_k_exp, allow_tf32=False) * tl.where(
@@ -949,10 +946,7 @@ def chunk_gla_bwd_kernel_intra_npu(
                     q + (bos * H + i_h) * K + o_jg[:, None] * (H * K) + o_k[None, :],
                     mask=m_jk, other=0.0,
                 ).to(tl.float32)
-                b_g_diag = tl.load(
-                    g + (bos * H + i_h) * K + o_jg[:, None] * (H * K) + o_k[None, :],
-                    mask=m_jk, other=0.0,
-                ).to(tl.float32)
+                b_g_diag = tl.extract_slice(b_g, [j_start, 0], [16, BK], [1, 1])
                 b_q_exp = tl.where(m_jk, b_q_diag * exp2(b_g_diag - b_gm[None, :]), 0.0)
                 b_dA_diag_dk = b_dA_diag + 0.0  # Ascend tl.dot may clobber its left operand.
                 b_dk += tl.dot(b_dA_diag_dk, b_q_exp, allow_tf32=False) * tl.where(
