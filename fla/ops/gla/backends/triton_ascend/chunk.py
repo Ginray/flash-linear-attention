@@ -776,6 +776,11 @@ def chunk_gla_bwd_dv_npu(
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     BK, BV = _bwd_pick_bk(K), _bwd_pick_bv(V)
+    if (
+        state_v_first and cu_seqlens is None and chunk_size == 64
+        and K == V == 256 and T <= 4096
+    ):
+        BK = 128
     dv = torch.zeros_like(do)
     launch_grid_chunked(
         chunk_gla_bwd_kernel_dv_npu,
