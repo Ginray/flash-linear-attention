@@ -1030,11 +1030,17 @@ def chunk_gla_bwd_kernel_inter_npu(
     H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     BT: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr,
     IS_VARLEN: tl.constexpr, STATE_V_FIRST: tl.constexpr, DH_STATE_V_FIRST: tl.constexpr,
+    GRID_BH_FIRST: tl.constexpr,
     A_OFFSET, NT_OFFSET, BH_OFFSET,
 ):
-    i_k = tl.program_id(0) + A_OFFSET
-    i_t = tl.program_id(1).to(tl.int64) + NT_OFFSET
-    i_bh = tl.program_id(2).to(tl.int64) + BH_OFFSET
+    if GRID_BH_FIRST:
+        i_bh = tl.program_id(0).to(tl.int64) + BH_OFFSET
+        i_t = tl.program_id(1).to(tl.int64) + NT_OFFSET
+        i_k = tl.program_id(2) + A_OFFSET
+    else:
+        i_k = tl.program_id(0) + A_OFFSET
+        i_t = tl.program_id(1).to(tl.int64) + NT_OFFSET
+        i_bh = tl.program_id(2).to(tl.int64) + BH_OFFSET
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_tg = i_t
@@ -1141,16 +1147,28 @@ def chunk_gla_bwd_dqkg_npu(
     dg = torch.empty_like(g, dtype=dg_dtype or g.dtype)
     # Keep the merge in fp32, then cast once at the final inter-kernel store.
     dq2, dk2 = torch.empty_like(q), torch.empty_like(k)
+    grid_bh_first = (
+        cu_seqlens is None and K == 128 and V == 128
+        and triton.cdiv(K, BK) == 2 and B * H == 96
+        and NT == 128 and T == NT * BT
+    )
+    if grid_bh_first:
+        grid = (B * H, NT, triton.cdiv(K, BK))
+        offset_keys = ('BH_OFFSET', 'NT_OFFSET', 'A_OFFSET')
+    else:
+        grid = (triton.cdiv(K, BK), NT, B * H)
+        offset_keys = ('A_OFFSET', 'NT_OFFSET', 'BH_OFFSET')
     launch_grid_chunked(
         chunk_gla_bwd_kernel_inter_npu,
-        (triton.cdiv(K, BK), NT, B * H),
-        offset_keys=('A_OFFSET', 'NT_OFFSET', 'BH_OFFSET'),
+        grid,
+        offset_keys=offset_keys,
         kernel_kwargs=dict(
             q=q, k=k, v=v, g=g, h=h, do=do, dh=dh, dq=dq, dk=dk,
             dq2=dq2, dk2=dk2, dg=dg,
             cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, scale=scale, T=T,
             H=H, K=K, V=V, BT=BT, BK=BK, BV=BV, STATE_V_FIRST=state_v_first,
             DH_STATE_V_FIRST=state_v_first if dh_state_v_first is None else dh_state_v_first,
+            GRID_BH_FIRST=grid_bh_first,
             A_OFFSET=0, NT_OFFSET=0, BH_OFFSET=0,
         ),
         compile_kwargs=_GLA_COMPILE_KWARGS,
