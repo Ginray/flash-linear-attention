@@ -339,6 +339,8 @@ def chunk_fwd_h_npu(
     BK, BV = _chunk_gated_h_tile_size(
         K, V, use_gk=gk is not None, state_v_first=state_v_first,
     )
+    if gk is not None and not state_v_first and K == 128 and V == 128 and T <= 4096:
+        BV = 128
     if gk is not None and not state_v_first and K == 256 and V == 256 and T <= 4096:
         BK = 64
         BV = 128
