@@ -1149,6 +1149,7 @@ def chunk_gla_bwd_dqkg(
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
     dh_state_v_first: bool | None = None,
+    dg_dtype: torch.dtype | None = None,
 ):
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = chunk_size
@@ -1157,7 +1158,7 @@ def chunk_gla_bwd_dqkg(
         chunk_indices = prepare_chunk_indices(cu_seqlens, chunk_size)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    dg = torch.empty_like(g)
+    dg = torch.empty_like(g, dtype=dg_dtype or g.dtype)
     dq2 = torch.empty_like(dq)
     dk2 = torch.empty_like(dk)
     def grid(meta): return (triton.cdiv(K, meta['BK']), NT, B * H)
@@ -1267,6 +1268,7 @@ def chunk_gla_bwd(
     cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
+    input_g_dtype: torch.dtype | None = None,
 ):
     if g_cumsum is None:
         g_cumsum = chunk_local_cumsum(
@@ -1363,6 +1365,7 @@ def chunk_gla_bwd(
         chunk_indices=chunk_indices,
         state_v_first=state_v_first,
         dh_state_v_first=dh_state_v_first,
+        dg_dtype=input_g_dtype if q.device.type == 'npu' else None,
     )
     return dq, dk, dv, dg, dh0
 
@@ -1385,6 +1388,7 @@ class ChunkGLAFunction(torch.autograd.Function):
         cu_seqlens_cpu,
         grad_enabled,
     ):
+        input_g_dtype = g.dtype
         chunk_size = min(64, max(16, triton.next_power_of_2(q.shape[1])))
         if cu_seqlens is not None:
             chunk_indices = prepare_chunk_indices(
@@ -1431,6 +1435,7 @@ class ChunkGLAFunction(torch.autograd.Function):
         ctx.scale = scale
         ctx.cu_seqlens = cu_seqlens
         ctx.state_v_first = state_v_first
+        ctx.input_g_dtype = input_g_dtype
         return o, ht
 
     @staticmethod
@@ -1454,6 +1459,7 @@ class ChunkGLAFunction(torch.autograd.Function):
             chunk_size=chunk_size,
             chunk_indices=chunk_indices,
             state_v_first=ctx.state_v_first,
+            input_g_dtype=ctx.input_g_dtype,
         )
         return dq.to(q), dk.to(k), dv.to(v), dg, None, dh0, None, None, None, None, None
 

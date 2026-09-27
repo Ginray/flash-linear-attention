@@ -1131,6 +1131,7 @@ def chunk_gla_bwd_dqkg_npu(
     chunk_size: int = 64,
     chunk_indices: torch.LongTensor | None = None,
     dh_state_v_first: bool | None = None,
+    dg_dtype: torch.dtype | None = None,
 ):
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = chunk_size
@@ -1140,7 +1141,7 @@ def chunk_gla_bwd_dqkg_npu(
     BK, BV = _bwd_pick_bk(K), _bwd_pick_bv(V)
     if not state_v_first and K == 256 and V == 256 and T <= 4096:
         BV = 128
-    dg = torch.empty_like(g)
+    dg = torch.empty_like(g, dtype=dg_dtype or g.dtype)
     # Keep the merge in fp32, then cast once at the final inter-kernel store.
     dq2, dk2 = torch.empty_like(q), torch.empty_like(k)
     launch_grid_chunked(
