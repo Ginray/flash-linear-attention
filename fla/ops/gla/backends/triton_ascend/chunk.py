@@ -802,6 +802,8 @@ def chunk_gla_bwd_dv_npu(
         and K == V == 256 and T <= 4096
     ):
         BK = 128
+        if (B, T, H) == (8, 2048, 32):
+            BV = 128
     dv = torch.zeros_like(do)
     launch_grid_chunked(
         chunk_gla_bwd_kernel_dv_npu,
