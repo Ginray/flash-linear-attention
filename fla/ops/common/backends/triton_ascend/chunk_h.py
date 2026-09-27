@@ -346,6 +346,8 @@ def chunk_fwd_h_npu(
     if gk is not None and not state_v_first and K == 256 and V == 256 and T <= 4096:
         BK = 64
         BV = 128
+        if (B, T, H) == (8, 2048, 32):
+            BV = 256
     launch_grid_chunked(
         chunk_fwd_kernel_h_npu,
         (triton.cdiv(K, BK), triton.cdiv(V, BV), N * H),
