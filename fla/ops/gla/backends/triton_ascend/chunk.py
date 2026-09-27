@@ -1141,8 +1141,8 @@ def chunk_gla_bwd_dqkg_npu(
     if not state_v_first and K == 256 and V == 256 and T <= 4096:
         BV = 128
     dg = torch.empty_like(g)
-    # Each inter program owns a disjoint token/head/key tile, so it can add in place.
-    dq2, dk2 = dq, dk
+    # Keep the merge in fp32, then cast once at the final inter-kernel store.
+    dq2, dk2 = torch.empty_like(q), torch.empty_like(k)
     launch_grid_chunked(
         chunk_gla_bwd_kernel_inter_npu,
         (triton.cdiv(K, BK), NT, B * H),
