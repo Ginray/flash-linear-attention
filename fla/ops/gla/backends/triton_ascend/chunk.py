@@ -660,6 +660,8 @@ def chunk_gla_bwd_dA_npu(
     if V == 128:
         # The [BT, BT] accumulator fits one full V reduction tile.
         BV = 128
+    if cu_seqlens is None and V == 256:
+        BV = 128
     dA = v.new_zeros(B, T, H, BT, dtype=torch.float)
     launch_grid_chunked(
         chunk_gla_bwd_kernel_dA_npu,
