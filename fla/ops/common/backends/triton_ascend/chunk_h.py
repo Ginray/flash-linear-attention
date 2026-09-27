@@ -445,7 +445,7 @@ def chunk_bwd_dh_npu(
         and not state_v_first
         and K == V == 128
         and BT == 64
-        and T <= 4096
+        and T <= 16384
     ):
         BK = 128
     if (
