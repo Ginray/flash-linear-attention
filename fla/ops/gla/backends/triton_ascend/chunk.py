@@ -674,11 +674,12 @@ def chunk_gla_bwd_dA_npu(
     if cu_seqlens is None and V == 256:
         BV = 128
     native_dot = (
-        cu_seqlens is None and v.dtype == torch.bfloat16 and chunk_size == 64
+        cu_seqlens is None and v.dtype == do.dtype == torch.bfloat16 and chunk_size == 64
         and (
             (B, T, H, V) == (4, 2048, 16, 128)
             or (B, T, H, V) == (1, 8192, 96, 128)
             or (B, T, H, V) == (4, 4096, 64, 128)
+            or (B, T, H, V) == (8, 2048, 32, 256)
         )
     )
     dA = v.new_zeros(B, T, H, BT, dtype=torch.float)
