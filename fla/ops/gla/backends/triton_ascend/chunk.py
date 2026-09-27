@@ -1211,6 +1211,10 @@ def chunk_gla_bwd_dqkg_npu(
         cu_seqlens is None and K == 128 and V == 128
         and triton.cdiv(K, BK) == 2 and B * H == 96
         and NT == 128 and T == NT * BT
+    ) or (
+        cu_seqlens is None and not state_v_first
+        and B == 8 and T == 2048 and H == 32 and K == V == 256
+        and BT == 64 and NT == 32 and triton.cdiv(K, BK) == 4
     )
     if grid_bh_first:
         grid = (B * H, NT, triton.cdiv(K, BK))
