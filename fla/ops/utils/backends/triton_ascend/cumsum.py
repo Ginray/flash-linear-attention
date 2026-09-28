@@ -98,6 +98,7 @@ def _launch_local_cumsum_vector(
     H,
     S,
     BT,
+    BT_SCAN,
     BS,
     NT,
     reverse,
@@ -114,6 +115,7 @@ def _launch_local_cumsum_vector(
         H=H,
         S=S,
         BT=BT,
+        BT_SCAN=BT_SCAN,
         BS=BS,
         REVERSE=reverse,
         num_warps=_NUM_WARPS,
@@ -206,6 +208,7 @@ def chunk_local_cumsum_vector_kernel_npu(
     H: tl.constexpr,
     S: tl.constexpr,
     BT: tl.constexpr,
+    BT_SCAN: tl.constexpr,
     BS: tl.constexpr,
     REVERSE: tl.constexpr,
     HAS_SCALE: tl.constexpr,
@@ -225,16 +228,45 @@ def chunk_local_cumsum_vector_kernel_npu(
         bos = tl.cast(i_b, tl.int64) * T
         eos = bos + T
 
-    p_s = tl.make_block_ptr(s + (bos * H + i_h) * S, (T, S), (H*S, 1), (i_t * BT, i_s * BS), (BT, BS), (1, 0))
-    p_o = tl.make_block_ptr(o + (bos * H + i_h) * S, (T, S), (H*S, 1), (i_t * BT, i_s * BS), (BT, BS), (1, 0))
-    b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
-    if REVERSE:
-        b_o = tl.cumsum(b_s, axis=0, reverse=True)
+    if BT_SCAN == BT:
+        p_s = tl.make_block_ptr(
+            s + (bos * H + i_h) * S, (T, S), (H * S, 1),
+            (i_t * BT, i_s * BS), (BT, BS), (1, 0),
+        )
+        p_o = tl.make_block_ptr(
+            o + (bos * H + i_h) * S, (T, S), (H * S, 1),
+            (i_t * BT, i_s * BS), (BT, BS), (1, 0),
+        )
+        b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
+        if REVERSE:
+            b_o = tl.cumsum(b_s, axis=0, reverse=True)
+        else:
+            b_o = tl.cumsum(b_s, axis=0)
+        if HAS_SCALE:
+            b_o *= scale
+        tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
     else:
-        b_o = tl.cumsum(b_s, axis=0)
-    if HAS_SCALE:
-        b_o *= scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+        b_carry = tl.zeros([BS], dtype=tl.float32)
+        for i_sub in tl.static_range(0, BT, BT_SCAN):
+            sub_start = BT - BT_SCAN - i_sub if REVERSE else i_sub
+            p_s = tl.make_block_ptr(
+                s + (bos * H + i_h) * S, (T, S), (H * S, 1),
+                (i_t * BT + sub_start, i_s * BS), (BT_SCAN, BS), (1, 0),
+            )
+            p_o = tl.make_block_ptr(
+                o + (bos * H + i_h) * S, (T, S), (H * S, 1),
+                (i_t * BT + sub_start, i_s * BS), (BT_SCAN, BS), (1, 0),
+            )
+            b_s = tl.load(p_s, boundary_check=(0, 1)).to(tl.float32)
+            if REVERSE:
+                b_o = tl.cumsum(b_s, axis=0, reverse=True)
+            else:
+                b_o = tl.cumsum(b_s, axis=0)
+            b_o += b_carry[None, :]
+            if HAS_SCALE:
+                b_o *= scale
+            tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+            b_carry += tl.sum(b_s, axis=0)
 
 
 @triton.heuristics({
@@ -398,6 +430,16 @@ def chunk_local_cumsum_vector_npu(
     assert chunk_size == 2**(chunk_size.bit_length()-1), "chunk_size must be a power of 2"
 
     BS = _get_vector_bs(BT, S, fallback=_FALLBACK_BS_LOCAL)
+    BT_SCAN = BT
+    if (
+        cu_seqlens is None
+        and not reverse
+        and not use_graph
+        and g.dtype == torch.bfloat16
+        and (B, T, H, S, BT) == (8, 2048, 32, 256, 64)
+    ):
+        BT_SCAN = 32
+        BS = _get_vector_bs(BT_SCAN, S, fallback=_FALLBACK_BS_LOCAL)
     BS = compute_grid_limited_tile_size(
         S,
         NT * B * H,
@@ -417,6 +459,7 @@ def chunk_local_cumsum_vector_npu(
         H=H,
         S=S,
         BT=BT,
+        BT_SCAN=BT_SCAN,
         BS=BS,
         NT=NT,
         reverse=reverse,
