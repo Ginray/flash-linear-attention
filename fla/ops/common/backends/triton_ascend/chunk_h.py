@@ -7,10 +7,11 @@
 
 """chunk_fwd_h / chunk_bwd_dh for triton-ascend on Ascend NPU (GLA-style state).
 
-Ascend requires host-specialized ``NT`` + ``tl.static_range(NT)``. Dynamic
-``for i_t in range(tl.cdiv(T, BT))`` under-iterates when ``T`` is unspecialized.
-The kernels below only handle equal-length inputs; varlen inputs are split per
-sequence on the host (see ``chunk_fwd_h_npu``/``chunk_bwd_dh_npu``).
+Ascend requires host-specialized ``NT`` because ``T`` is unspecialized in the
+kernels below; deriving the loop bound directly from ``T`` can under-iterate.
+The forward per-key-gated path rolls the constexpr-bounded loop; other forward
+gate modes stay fully unrolled. Varlen inputs are split per sequence on the
+host (see ``chunk_fwd_h_npu``/``chunk_bwd_dh_npu``).
 """
 
 from __future__ import annotations
@@ -30,14 +31,33 @@ _BV = 64
 
 
 def _chunk_h_tile_size(K: int, V: int) -> tuple[int, int]:
-    """Pick BK/BV for chunk_h on Ascend.
-
-    BK=BV=64 overflows UB when K,V>=256 and USE_GK loads extra fp32 tiles
-    (b_k/b_gk/b_h/b_v), which surfaces as MTE DDR OOB for large B*H.
-    """
+    """Pick a conservative BK/BV for generic chunk_h paths."""
     if K > 128 or V > 128:
         return 32, 32
     return _BK, _BV
+
+
+def _chunk_fwd_h_tile_size(
+    K: int,
+    V: int,
+    NT: int,
+    BT: int,
+    *,
+    use_gk_only: bool,
+    state_v_first: bool,
+) -> tuple[int, int]:
+    """Pick forward state tiles from validated dimension-level regimes."""
+    BK, BV = _chunk_h_tile_size(K, V)
+    if not use_gk_only or state_v_first or BT != 64:
+        return BK, BV
+
+    if K == 128 and V == 128:
+        # Wider V is beneficial across D128 workloads. Once the recurrence
+        # spans many chunks, a wider K tile also amortizes program overhead.
+        return (128 if NT > 64 else BK), 128
+    if K == 256 and V == 256 and NT <= 64:
+        return 64, 128
+    return BK, BV
 
 
 @triton.heuristics({
@@ -50,6 +70,7 @@ def chunk_fwd_kernel_h_npu(
     H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     BT: tl.constexpr, BS: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, NT: tl.constexpr,
     USE_G: tl.constexpr, USE_G_GAMMA: tl.constexpr, USE_GK: tl.constexpr, USE_GV: tl.constexpr,
+    USE_GK_ONLY: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr, STORE_FINAL_STATE: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
     K_OFFSET, V_OFFSET, NH_OFFSET,
@@ -78,7 +99,7 @@ def chunk_fwd_kernel_h_npu(
             p_h0 = h0 + h0_base + o_k[:, None].to(tl.int64) * V + o_v[None, :]
             b_h = tl.load(p_h0, mask=(o_k[:, None] < K) & (o_v[None, :] < V), other=0.0).to(tl.float32)
 
-    for i_t in tl.static_range(NT):
+    for i_t in tl.range(0, NT, loop_unroll_factor=1 if USE_GK_ONLY else NT):
         i_s = i_t // NTS
         o_t = (i_t * BT + tl.arange(0, BT)).to(tl.int64)
         m_t = o_t < T
@@ -153,6 +174,7 @@ def chunk_bwd_kernel_dh_npu(
     HQ: tl.constexpr, H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     BT: tl.constexpr, BS: tl.constexpr, BK: tl.constexpr, BV: tl.constexpr, NT: tl.constexpr, NG: tl.constexpr,
     USE_G: tl.constexpr, USE_G_GAMMA: tl.constexpr, USE_GK: tl.constexpr, USE_GV: tl.constexpr,
+    USE_GK_ONLY: tl.constexpr,
     STORE_INITIAL_STATE_GRADIENT: tl.constexpr, USE_FINAL_STATE_GRADIENT: tl.constexpr,
     STATE_V_FIRST: tl.constexpr,
     K_OFFSET, V_OFFSET, NH_OFFSET,
@@ -181,7 +203,13 @@ def chunk_bwd_kernel_dh_npu(
             p_dht = dht + dht_base + o_k[:, None].to(tl.int64) * V + o_v[None, :]
             b_dh += tl.load(p_dht, mask=(o_k[:, None] < K) & (o_v[None, :] < V), other=0.0).to(tl.float32)
 
-    for step in tl.static_range(NT):
+    for step in tl.range(
+        0, NT,
+        loop_unroll_factor=8 if (
+            ((USE_GK_ONLY and K == 128) and (NT >= 8 and NT <= 256))
+            or ((USE_GK_ONLY and K == 256) and (NT >= 8 and NT <= 64))
+        ) else NT,
+    ):
         i_t = NT - 1 - step
         i_s = i_t // (BS // BT)
         o_dh = ((boh + i_s) * H + i_h) * K * V
@@ -316,7 +344,15 @@ def chunk_fwd_h_npu(
     h = k.new_zeros(B, NS, H, *state_shape, dtype=torch.float if states_in_fp32 else k.dtype)
     ht = k.new_zeros(N, H, *state_shape, dtype=torch.float) if output_final_state else None
 
-    BK, BV = _chunk_h_tile_size(K, V)
+    use_gk_only = gk is not None and g is None and g_gamma is None and gv is None
+    BK, BV = _chunk_fwd_h_tile_size(
+        K,
+        V,
+        NT,
+        BT,
+        use_gk_only=use_gk_only,
+        state_v_first=state_v_first,
+    )
     launch_grid_chunked(
         chunk_fwd_kernel_h_npu,
         (triton.cdiv(K, BK), triton.cdiv(V, BV), N * H),
@@ -326,6 +362,7 @@ def chunk_fwd_h_npu(
             H=H, K=K, V=V, BT=BT, BS=BS, BK=BK, BV=BV, NT=NT,
             USE_G=g is not None, USE_G_GAMMA=g_gamma is not None,
             USE_GK=gk is not None, USE_GV=gv is not None,
+            USE_GK_ONLY=use_gk_only,
             STATE_V_FIRST=state_v_first,
             K_OFFSET=0, V_OFFSET=0, NH_OFFSET=0,
         ),
@@ -402,6 +439,7 @@ def chunk_bwd_dh_npu(
     N, NS = B, triton.cdiv(T, BS)
     NG = HQ // H
     NT = triton.cdiv(T, BT)
+    use_gk_only = gk is not None and g is None and g_gamma is None and gv is None
 
     state_shape = (V, K) if state_v_first else (K, V)
     dh = k.new_zeros(B, NS, HQ, *state_shape, dtype=torch.float if states_in_fp32 else k.dtype)
@@ -418,6 +456,7 @@ def chunk_bwd_dh_npu(
             HQ=HQ, H=H, K=K, V=V, BT=BT, BS=BS, BK=BK, BV=BV, NT=NT, NG=NG,
             USE_G=g is not None, USE_G_GAMMA=g_gamma is not None,
             USE_GK=gk is not None, USE_GV=gv is not None,
+            USE_GK_ONLY=use_gk_only,
             STATE_V_FIRST=state_v_first,
             K_OFFSET=0, V_OFFSET=0, NH_OFFSET=0,
         ),
